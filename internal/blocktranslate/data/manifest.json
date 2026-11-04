@@ -1,0 +1,12 @@
+{
+  "source": "https://github.com/CloudburstMC/Data",
+  "license": "Apache-2.0 (LICENSE.Cloudburst)",
+  "format": "gzip, big-endian NBT compound blocks list; network_id verified against computed FNV-1a typed state hash",
+  "snapshots": [
+    {"file":"1001.nbt","protocol":1001,"commit":"4634cd1725b4fb765c1c4431ae16a0bca77f93d0","states":16913,"sha256":"73ef6dadfa16dd52319493c8112ecb13a020989cf04452f76ff4a8a250a29fea"},
+    {"file":"2168.nbt","protocol":2168,"commit":"619483eb88140f46b8933506c6263861c0d8fa43","states":17499,"sha256":"26826e766aa0916d757706adbbb53da0f548308a14ab0ff389db9dec9b297aca"},
+    {"file":"2193.nbt","protocol":2193,"commit":"a8a4341d7763d6eb8547cff3ca46b4153d60163d","states":22091,"sha256":"54c9bed0bef30aadc316b21c6e82b5ac407c5c6e351b9d9690aa4e9a49fec912"}
+  ],
+  "protocol2169": "Shares2168 block schema; test verifies full typed StateKey set equals pinned go-multiversion/data/v2169. Does not use2168 wire codec for2169.",
+  "compatibility": "Matches protocol families, not a promise for arbitrary previews or future builds sharing an ID. Custom runtime-ID ordering is rejected; custom state hashing only supports explicit typed state properties."
+}

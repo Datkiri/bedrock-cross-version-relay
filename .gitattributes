@@ -1,0 +1,15 @@
+# Normalise line endings in the repository; check out with the platform default.
+* text=auto
+
+# Go sources, docs and data are stored as LF so diffs and hashes stay stable.
+*.go    text eol=lf
+*.md    text eol=lf
+*.mod   text eol=lf
+*.sum   text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+Makefile text eol=lf
+*.sh    text eol=lf
+
+# Pinned registry snapshots are binary and must never be touched.
+*.nbt   binary

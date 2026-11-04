@@ -1,0 +1,19 @@
+# Build output
+/dist/
+*.exe
+*.exe~
+
+# Runtime artifacts written next to the binary / working directory
+/log/
+hostproto.json
+
+# Diagnostic dumps produced by -dumpwire / -dumpsubchunk / -dumpstartgame
+wire-*.bin
+subchunk-*.bin
+startgame-*.bin
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
