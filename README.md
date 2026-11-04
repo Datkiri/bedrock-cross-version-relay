@@ -201,6 +201,7 @@ cmd/xvrelay/host_recipes1001.go  recipe / movement-bitset handling for 1001 host
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
 internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address)
 internal/mcport/          Minecraft port detection helpers
+java/                     JVM port of the translation layer — status and scope in java/README.md
 third_party/              pinned forks of go-nethernet and gophertunnel (protocol 2193 support)
 docs/                     protocol matrix, block-translation design notes, research notes
 ```
@@ -254,6 +255,33 @@ make matrix        # or: XVER_MATRIX_REPORT=dist/matrix.json go test ./cmd/xvrel
 Only the wire and translation layers are exercised by the test suite. See
 [What is actually verified](#what-is-actually-verified) for the boundary between "tested" and
 "played".
+
+## Java port
+
+`java/` is a JVM reimplementation of the translation layer, built with nothing but a JDK — no
+Maven, no Gradle, dependencies vendored in `java/lib` and pinned by SHA-256.
+
+It is **not a working relay yet**, and it says so at the top of
+[`java/README.md`](java/README.md). What it does have is the part that had to be exact before
+anything else: `StateHash` reproduces `internal/blocktranslate/hash.go` byte for byte, so all
+56 503 pinned block states hash identically on both sides, and `BlockMapper` maps them with the
+same two-pass rules as the Go relay.
+
+```bash
+make java-check     # or: cd java && ./build.sh check
+```
+
+```
+1001 -> 2193  states=16913  exact=16329  reduced=72    fallback=512   (96.97% exact)
+2168 -> 2193  states=17499  exact=16906  reduced=73    fallback=520   (97.03% exact)
+2193 -> 1001  states=22091  exact=16329  reduced=3712  fallback=2050  (90.72% exact)
+2193 -> 2168  states=22091  exact=16906  reduced=3768  fallback=1417  (93.59% exact)
+```
+
+LAN discovery, RakNet, NetherNet transport, the spawn gate and chunk translation are **not
+written** on the Java side. Those layers are where the compatibility risk actually lives, and
+shipping them untested against a real client would be worse than not shipping them. The Go relay
+is the tested implementation.
 
 ## Related work
 

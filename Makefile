@@ -4,6 +4,8 @@
 #   make test      # go test ./...
 #   make matrix    # 4x4 diagnostic report -> dist/matrix.json
 #   make release   # all six platform binaries -> dist/
+#   make java      # Java translation core -> java/out, java/out-tools
+#   make java-check  # compile the Java tree and run its probes
 #   make clean
 
 BIN      := xvrelay
@@ -17,7 +19,7 @@ export GOFLAGS     := -buildvcs=false
 
 PLATFORMS := linux/amd64 linux/arm64 linux/arm windows/amd64 darwin/amd64 darwin/arm64
 
-.PHONY: all build test vet matrix release clean fmt
+.PHONY: all build test vet matrix release java java-check java-clean clean fmt
 
 all: build
 
@@ -48,6 +50,17 @@ release:
 		echo "  $$out"; \
 		GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o $$out $(PKG); \
 	done
+
+# Java side. Translation core only: it compiles and its probes pass, but it
+# cannot relay a session yet. See java/README.md for the honest scope.
+java:
+	@cd java && ./build.sh build
+
+java-check:
+	@cd java && ./build.sh check
+
+java-clean:
+	@cd java && ./build.sh clean
 
 clean:
 	rm -rf $(DIST)
