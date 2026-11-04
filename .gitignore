@@ -12,6 +12,11 @@ wire-*.bin
 subchunk-*.bin
 startgame-*.bin
 
+# Java build output
+*.class
+/java/out/
+/java/out-tools/
+
 # Editor / OS noise
 .DS_Store
 Thumbs.db
