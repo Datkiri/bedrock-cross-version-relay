@@ -27,8 +27,9 @@
 //
 // KNOWN LIMITS (read before judging any result):
 //   - Cross-version terrain uses internal/blocktranslate with pinned vanilla palettes.
-//     Unsupported known states use a visible placeholder. Item registries, biome schemas
-//     and arbitrary addon/resource-pack conversion are separate compatibility concerns.
+//     Unsupported known states use a visible placeholder. Item REGISTRIES are now pinned for all
+//     four protocol families, but item semantics inside gameplay packets (recipes, biome schemas,
+//     entity metadata, arbitrary addon/resource-pack content) remain separate concerns.
 //   - The fork in `third_party/gophertunnel-2193` does NOT carry the `rescueDisplayName` patch the
 //     bridge fork had, so the client must be signed into Xbox Live (must have a XUID). An offline
 //     client is rejected at Login with "DisplayName must not be empty".
@@ -863,7 +864,7 @@ func proto1001() minecraft.Protocol {
 		start := time.Now()
 		// nativeItems = the 2193 item table (modern client) ⇒ the mapper knows both directions:
 		// 2193→1001 (ConvertFromLatest) and 1001→2193 (ConvertToLatest, the host read path).
-		nativeItems, ierr := blocktranslate.Items(2193)
+		nativeItems, ierr := blocktranslate.NativeItems()
 		if ierr != nil {
 			slog.Warn("xvrelay: no 2193 item registry — item mapping will rely on GameData", "error", ierr)
 			nativeItems = nil
@@ -881,6 +882,33 @@ func proto1001() minecraft.Protocol {
 	return proto1001Value
 }
 
+// clientItemRegistry picks the ItemRegistry to put in GameData.Items for an incoming client.
+//
+// The listener sends GameData.Items as an ItemRegistry packet through WritePacket, which runs the
+// client codec's ConvertFromLatest. There are two behaviours, and mixing them up is destructive:
+//   - registry-aware (NewWithRegistries, currently only 1001): the codec TRANSLATES the packet
+//     itself and expects the NATIVE (2193) table as input. Handing it the client's own table makes
+//     ValidateNativeEntries fail and the WHOLE ItemRegistry packet is dropped (return nil).
+//   - registry-less (plain New(), currently 2168/2169): ConvertFromLatest is a pass-through, so
+//     GameData.Items must already BE the client protocol's own table.
+//
+// Measured in internal/blocktranslate/items_test.go:TestItemRegistryMatchesCodec — the tables
+// returned by blocktranslate.Items are exactly what the registry-aware codecs emit, and
+// v1_26_45.New() passes all 2076 native entries through unchanged.
+func clientItemRegistry(clientProto int32) ([]protocol.ItemEntry, string, error) {
+	if clientProto == 1001 {
+		// Ensure the cached adapter has been built; sync.Once makes later calls free and also
+		// establishes the happens-before for reading adapter1001HasRegistry.
+		proto1001()
+		if adapter1001HasRegistry {
+			items, err := blocktranslate.NativeItems()
+			return items, "native 2193 (1001 codec translates it)", err
+		}
+	}
+	items, err := blocktranslate.Items(clientProto)
+	return items, fmt.Sprintf("protocol %d (codec is pass-through)", clientProto), err
+}
+
 // protocolForVersion maps a Minecraft version string → protocol id.
 // Used to VERIFY auto-probing: a lenient host (like the host app) may accept a protocol that is
 // not its own, but StartGame still declares the real version.
@@ -888,7 +916,7 @@ func protocolForVersion(v string) int32 {
 	switch v {
 	case "1.26.30", "1.26.31", "1.26.32", "1.26.33", "1.26.34", "1.26.35", "1.26.36":
 		return 1001
-	case "1.26.44":
+	case "1.26.40", "1.26.41", "1.26.42", "1.26.43", "1.26.44":
 		return 2168
 	case "1.26.45":
 		return 2169
@@ -2067,16 +2095,19 @@ func handleConn(ctx context.Context, client *minecraft.Conn, ls *lansignal.Signa
 		return err
 	}
 	gd := serverConn.GameData()
-	// ★ Replace the HOST's item registry with the table of the CLIENT's OWN protocol.
-	// Without this, a 2193 client receives the 1933 items of 1.26.30 ⇒ IDs shift (2193 has 2076
-	// items, 143 exist only in 2193, 587 share a name but not an ID) ⇒ holding/placing/dropping
-	// items goes wrong, i.e. "lost items".
-	// This is exactly what Amber/Ouranos do: use the ItemTypeDictionary of the client protocol.
+	// ★ Do not let the client inherit the HOST's ItemRegistry. A client on another protocol
+	// would see the host's item network IDs, so holding/placing/dropping items goes wrong
+	// ("lost items"). Amber/Ouranos solve this with the client protocol's ItemTypeDictionary.
+	// Which table to feed depends on whether the client codec translates ItemRegistry itself —
+	// see clientItemRegistry. This used to call Items(clientProto) unconditionally, which would
+	// make the registry-aware 1001 adapter drop the packet entirely.
 	if client.Proto().ID() != sess.hostProto && !keepHostItems {
-		if items, ierr := blocktranslate.Items(client.Proto().ID()); ierr == nil {
+		items, source, ierr := clientItemRegistry(client.Proto().ID())
+		if ierr == nil {
 			gd.Items = items
-			slog.Info("xvrelay: ItemRegistry replaced with the client protocol's table",
-				"clientProto", client.Proto().ID(), "items", len(items), "hostItems", len(serverConn.GameData().Items))
+			slog.Info("xvrelay: ItemRegistry replaced",
+				"clientProto", client.Proto().ID(), "source", source,
+				"items", len(items), "hostItems", len(serverConn.GameData().Items))
 		} else {
 			slog.Warn("xvrelay: no item registry for the client — keeping the host's",
 				"clientProto", client.Proto().ID(), "error", ierr)

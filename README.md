@@ -37,10 +37,8 @@ This project is an experiment in doing exactly that, out in the open:
 - translate the **packet stream** between two Bedrock protocols, both directions;
 - translate **block palettes** in `SubChunk` (v8/v9), inline `LevelChunk`, `UpdateBlock`,
   `UpdateBlockSynced`, `UpdateSubChunkBlocks`, and the reverse direction for clicked/broken blocks;
-- translate the **item registry** so inventories survive the hop — **only into a 2193 client** at
-  present: `internal/blocktranslate/data/` ships one item table (`items-2193.json`), so a 2193 client
-  always gets its own 2076-entry table, while a 1001/2168/2169 client keeps the host's table and
-  item network IDs can still drift. See [Limitations](#limitations).
+- translate the **item registry** so inventories survive the hop — a table is pinned for each of
+  `1001`, `2168`, `2169` and `2193`; see [Block and item translation](#block-and-item-translation);
 - keep everything else as close to "just forward the bytes" as possible, so behaviour stays
   predictable and failures are visible in the log instead of silently corrupting the world.
 
@@ -135,15 +133,26 @@ the spawn-prefix gate are per-session, keyed by connection.
   (`minecraft:info_update`), counted in the log. It is never turned into air and never silently
   claimed as exact.
 - A source ID that is not in the pinned palette at all is a **hard error**, not a guess.
-- Item registries are per-protocol as well (`internal/blocktranslate/items.go`), so inventory contents
-  and `ItemStackRequest` survive the hop.
+- Item registries are per-protocol as well (`internal/blocktranslate/items.go`): `2193` comes from
+  the pinned Cloudburst snapshot (2076 items); `1001` (1933) and `2169` (1976) are built from the
+  same `go-multiversion` `vanilla_items.nbt` snapshots the protocol adapters use, via
+  `mapping.NewItemMapper(...).TargetEntries()`. `2168` shares `2169` because
+  `v1_26_44.NewWithRegistries` delegates to `v1_26_45`. A test asserts each table is byte-for-byte
+  the name/ID mapping its registry-aware codec emits.
+- Which table goes into `GameData.Items` depends on the client codec. A **registry-aware** codec
+  (currently `1001`) translates `ItemRegistry` itself and expects the **native `2193`** table as
+  input — feeding it the client's own table makes validation fail and the packet is dropped. A
+  **registry-less** codec (`2168`/`2169` use plain `New()`) passes it through, so it must be handed
+  the client's own table. `clientItemRegistry()` implements that rule; both branches are tested.
 - `SubChunk` v8 → v9 is upgraded when the target is `2193` (the Y byte after the storage count is new
   in v9); downgrades keep the remaining LevelChunk tail bytes intact.
 
 Palette sources are pinned by commit and SHA-256 in
 `internal/blocktranslate/data/manifest.json` (Apache-2.0, from [CloudburstMC/Data](https://github.com/CloudburstMC/Data)).
-Protocol `2169` shares the `2168` block schema; a test asserts the full typed-state set matches the
-pinned `2169` snapshot rather than reusing the `2168` codec.
+The historical item snapshots are pinned by the `go-multiversion` version in `go.sum`; their own
+manifests record the dragonfly commits. Protocol `2169` shares the `2168` block schema; a test
+asserts the full typed-state set matches the pinned `2169` snapshot rather than reusing the `2168`
+codec.
 
 ## Flags
 
@@ -180,7 +189,10 @@ Honest scope, because "it builds" and "it works" are different claims.
   `make matrix` prints the per-pair count and writes `dist/matrix.json`; the last run reported
   `checks=8` with no findings for all 16 pairs.
 - **Registry level:** every block state in the three pinned palettes is checked for identity mapping,
-  and every unsupported state is asserted to produce the visible placeholder.
+  and every unsupported state is asserted to produce the visible placeholder. All four item tables
+  are checked for unique names/IDs and for matching the registry-aware codecs' output; the
+  pass-through codec case and the non-native-input drop are both asserted in
+  `cmd/xvrelay/item_registry_test.go`.
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, resource packs, biomes, entity
@@ -192,9 +204,16 @@ Honest scope, because "it builds" and "it works" are different claims.
 - **The client must be signed into Xbox Live.** The vendored `2193` fork does not rescue an empty
   `DisplayName`, so an offline client is rejected at login with
   `DisplayName must not be empty`. A real Microsoft account is required on the client side.
-- **Terrain, block updates and clicked-block IDs** are translated. Item semantics across versions,
-  recipes, biome schemas, entity metadata, block-entity NBT, particles and arbitrary add-on content
+- **Terrain, block updates, clicked-block IDs and the advertised item registry** are translated.
+  Recipes, biome schemas, entity metadata, block-entity NBT, particles and arbitrary add-on content
   are separate problems and are **not** solved here.
+- **Item IDs inside gameplay packets are only mapped when the host codec is registry-aware.** The
+  relay advertises the correct item table to every client, but `2168`/`2169` hosts use the plain
+  `v1_26_45.New()` codec (no item mapper), so an `InventoryContent` packet from such a host keeps
+  the host's IDs. Measured: `v1_26_45.New().ConvertFromLatest` passes an `ItemRegistry` of 2076
+  native entries through unchanged, while `NewWithRegistries` emits 1976. Turning those codecs into
+  registry-aware ones would fix this, but it changes many gameplay packets at once and needs a real
+  client to validate — it is deliberately left as the next step.
 - **Ingress is RakNet only.** Clients reach the relay over RakNet; NetherNet is used for LAN discovery
   (UDP 7551) and for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`). A client
   that can only speak NetherNet — for example one joining through an activity handle instead of the
@@ -207,7 +226,14 @@ Honest scope, because "it builds" and "it works" are different claims.
 - **Protocol IDs are not a promise.** Two builds can share `2193` and still differ in registry
   contents. Snapshots are pinned per protocol, and previews/future builds are unsupported until
   re-pinned.
-- This is a LAN-world relay. Realms, cloud sessions, NAT traversal and matchmaking are out of scope.
+- **This is a LAN-world relay.** Realms, cloud sessions, NAT traversal and matchmaking are out of scope.
+- **Not yet covered by tests or a real client** (2026-11-05): multi-transport/NetherNet ingress
+  (CONN-002), UDP discovery integration and stale-peer eviction (CONN-003), live multi-client
+  soak/reconnect (CONN-004), resource-pack negotiation edge cases (CONN-005), and any CPU/RAM/
+  latency benchmark (RELAY-001). What **is** covered offline: the `ServerData` v5/v6/v7 parser
+  against malformed, truncated and trailing-byte payloads; the version→protocol table including
+  unknown/mismatched hosts; the block palette and item registry invariants; and the 16-pair wire
+  matrix. Do not read a missing row here as "verified".
 
 ## Layout
 
@@ -264,6 +290,14 @@ A relative report path is resolved against the module root (not the package dire
 toolchain runs the test in) and its parent directory is created if missing, so this works in a fresh
 clone where `dist/` does not exist yet. The test **skips** when `XVER_MATRIX_REPORT` is unset, so a
 plain `go test ./...` does not run it — silence there is not a pass.
+
+Measured baseline (2026-11-05, CGO disabled): `go build ./...`, `go vet ./...`, `go test ./...`
+all pass; all six release targets cross-compile (`linux amd64/arm64/arm`, `windows amd64`,
+`darwin amd64/arm64`); `go test -race ./cmd/xvrelay ./internal/blocktranslate` passes with CGO
+enabled. Four tests are opt-in and skip by default: `TestProtocolCompatibilityMatrix`
+(`XVER_MATRIX_REPORT`), `TestCapturedSubChunkPreservesBlockEntities` (`XVER_TERRAIN_CAPTURE`),
+and the two dump-dependent tests in `internal/blocktranslate` (they need a captured host payload).
+A green CI run is therefore **not** a claim about those four paths.
 
 ### Platform status
 

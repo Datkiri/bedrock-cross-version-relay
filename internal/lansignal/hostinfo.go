@@ -198,14 +198,19 @@ func decodeV6(buf *bytes.Buffer) (*HostInfo, error) {
 }
 
 // decodeV5 decodes the older ServerData layout used by some hosts (e.g. BDS 1.26.33 /
-// protocol 1001). It predates the Protocol, GameVersion and Nonce fields, and carries a
-// single combined auth byte instead of two separate flags. Player counts are fixed-width
-// int32 (same as v6). The layout is verified to consume the real v5 payload exactly:
+// protocol 1001). It predates the Protocol, GameVersion and Nonce fields. Player counts are
+// fixed-width int32 (same as v6), and the two auth flags are SEPARATE booleans — measured against
+// a real BDS 1.26.33 broadcast, the payload consumes exactly 47 bytes:
 //
-//	raw = 05 10 "Dedicated Server" 0d "Bedrock level" 00 [00000000] [0a000000]
-//	      00 01 01 04 08
-//	=> GameType=0, PlayerCount=0, MaxPlayerCount=10, EditorWorld=false, Hardcore=true,
-//	   auth=true, TransportLayer=4, ConnectionType=8.
+//	Version(1) ServerName(str) LevelName(str) GameType(varint32)
+//	PlayerCount(fixed i32 LE) MaxPlayerCount(fixed i32 LE)
+//	EditorWorld(bool) Hardcore(bool) AcceptsOnlineAuth(bool) AcceptsSelfSignedAuth(bool)
+//	TransportLayer(varint32 zigzag) ConnectionType(varint32 zigzag)
+//
+// A sample decode: ServerName="Dedicated Server", LevelName="Bedrock level", GameType=0,
+// PlayerCount=0, MaxPlayerCount=10, Hardcore=true, online auth=true, TransportLayer=2
+// (NetherNet), ConnectionType=4 (LAN), Nonce="" — v5 has NO nonce, so the joiner must not
+// require one for version < 6.
 func decodeV5(buf *bytes.Buffer) (*HostInfo, error) {
 	i := &HostInfo{AuthFlagsSeparate: true}
 	var err error

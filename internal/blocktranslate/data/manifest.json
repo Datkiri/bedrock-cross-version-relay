@@ -7,6 +7,17 @@
     {"file":"2168.nbt","protocol":2168,"commit":"619483eb88140f46b8933506c6263861c0d8fa43","states":17499,"sha256":"26826e766aa0916d757706adbbb53da0f548308a14ab0ff389db9dec9b297aca"},
     {"file":"2193.nbt","protocol":2193,"commit":"a8a4341d7763d6eb8547cff3ca46b4153d60163d","states":22091,"sha256":"54c9bed0bef30aadc316b21c6e82b5ac407c5c6e351b9d9690aa4e9a49fec912"}
   ],
+  "itemRegistries": {
+    "source": "2193 = CloudburstMC/Data runtime_item_states.json (items-2193.json); 1001/2169 = the go-multiversion data/v1001 and data/v2169 vanilla_items.nbt dragonfly snapshots, resolved at init through mapping.NewItemMapper(native, target).TargetEntries(). These are not independent pinned copies: they are the same snapshots the protocol adapters use.",
+    "dependency": "github.com/shawtymarco/go-multiversion v0.0.0-20260927132311-7d7f3d51d090 (pinned by go.sum)",
+    "entries": [
+      {"protocol":1001,"items":1933,"sourceCommit":"df-mc/dragonfly 705b8460b472508023e72f399c76f524a875fed7","vanillaItemsSha256":"0ad3c87f3cc76ad97d4742a24d77ceaf1f8652ed35db2b50937c2f95ff924dec"},
+      {"protocol":2168,"items":1976,"sharedWith":2169,"reason":"protocols/v1_26_44.NewWithRegistries delegates to v1_26_45.NewWithRegistries (shared 1.26.40-1.26.45 registry baseline); no data/v2168 package exists"},
+      {"protocol":2169,"items":1976,"sourceCommit":"shawtymarco/dragonfly dc54cf36e662411a770a9f0e91c1825cc310eb0a","vanillaItemsSha256":"a06a37780c30d10f170f544517ca1bd2ad40a6bce31b22fa126ad633248f5118"},
+      {"protocol":2193,"items":2076,"sourceCommit":"CloudburstMC/Data a8a4341d7763d6eb8547cff3ca46b4153d60163d"}
+    ],
+    "verification": "TestItemRegistryMatchesCodec feeds the native 2193 table into each registry-aware codec and asserts the emitted name/ID mapping equals Items(id). TestClientItemRegistryWiring asserts the caller's native-vs-own-table rule, including that a non-native input is dropped by the 1001 codec."
+  },
   "protocol2169": "Shares2168 block schema; test verifies full typed StateKey set equals pinned go-multiversion/data/v2169. Does not use2168 wire codec for2169.",
   "compatibility": "Matches protocol families, not a promise for arbitrary previews or future builds sharing an ID. Custom runtime-ID ordering is rejected; custom state hashing only supports explicit typed state properties."
 }
