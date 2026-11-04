@@ -5,6 +5,12 @@
 
 # xver compatibility matrix — 2026-10-26
 
+> **Correction, measured 2026-11-05:** the matrix now runs **8** checks per pair, not 7, so the
+> total is **16 × 8 = 128**. The extra check is `UpdateBlock` codec→relay→codec round-tripping,
+> which is present in the test but missing from the list below. Re-run on a clean tree:
+> `checks=8 findings=[]` for all 16 pairs, `dist/matrix.json` reports `128` total and `0` findings.
+> The `112` figures further down are the 2026-10-26 measurement and are kept as written.
+
 ## Update after the fix
 
 The findings below have been fixed. Post-fix matrix: **112/112 checks PASS, 16/16 combinations

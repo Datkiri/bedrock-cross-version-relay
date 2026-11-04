@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -21,6 +22,26 @@ type matrixResult struct {
 	Findings []string `json:"findings"`
 }
 
+// moduleRoot walks up from the test's working directory until it finds go.mod, so report paths
+// written by the test are stable no matter which directory the toolchain chose to run in.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("no go.mod found above %s", dir)
+		}
+		dir = parent
+	}
+}
+
 // Diagnostic matrix, opt-in because known failures are useful regression cases
 // rather than a claim that all protocol pairs already support gameplay.
 // XVER_MATRIX_REPORT is a caller-selected JSON report path.
@@ -28,6 +49,11 @@ func TestProtocolCompatibilityMatrix(t *testing.T) {
 	path := os.Getenv("XVER_MATRIX_REPORT")
 	if path == "" {
 		t.Skip("set XVER_MATRIX_REPORT to run the diagnostic 4x4 matrix")
+	}
+	// `go test` runs with the working directory set to this package, so a relative report path
+	// such as dist/matrix.json would land in cmd/xvrelay/dist/. Anchor it to the module root.
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(moduleRoot(t), path)
 	}
 	ids := []int32{1001, 2168, 2169, 2193}
 	var results []matrixResult
@@ -207,6 +233,13 @@ func TestProtocolCompatibilityMatrix(t *testing.T) {
 	data, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The report path is usually dist/matrix.json, and dist/ is gitignored ⇒ absent in a fresh
+	// clone. os.WriteFile does not create parents, so `make matrix` used to fail there.
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err = os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create report directory %s: %v", dir, err)
+		}
 	}
 	if err = os.WriteFile(path, append(data, '\n'), 0600); err != nil {
 		t.Fatal(err)

@@ -37,7 +37,10 @@ This project is an experiment in doing exactly that, out in the open:
 - translate the **packet stream** between two Bedrock protocols, both directions;
 - translate **block palettes** in `SubChunk` (v8/v9), inline `LevelChunk`, `UpdateBlock`,
   `UpdateBlockSynced`, `UpdateSubChunkBlocks`, and the reverse direction for clicked/broken blocks;
-- translate the **item registry** so inventories survive the hop;
+- translate the **item registry** so inventories survive the hop — **only into a 2193 client** at
+  present: `internal/blocktranslate/data/` ships one item table (`items-2193.json`), so a 2193 client
+  always gets its own 2076-entry table, while a 1001/2168/2169 client keeps the host's table and
+  item network IDs can still drift. See [Limitations](#limitations).
 - keep everything else as close to "just forward the bytes" as possible, so behaviour stays
   predictable and failures are visible in the log instead of silently corrupting the world.
 
@@ -50,7 +53,12 @@ Protocol IDs, not marketing versions — a build can share a protocol ID and sti
 | `1001` | 1.26.30 – 1.26.36 | client and host |
 | `2168` | 1.26.40 – 1.26.44 | client and host |
 | `2169` | 1.26.45 | client and host |
-| `2193` | 1.26.50 – 1.26.51 | client and host (native) |
+| `2193` | 1.26.50 – 1.26.52 | client and host (native) |
+
+`1.26.52` shares protocol `2193` with `1.26.50`/`1.26.51`, but the *version string* is not
+interchangeable: a Bedrock client refuses a server whose `GameVersion` is older than its own
+(measured: a 1.26.52 client handed `1.26.50` crashes itself after ~0.3 s), so the relay overrides
+`StartGame.GameVersion` with the client's real string.
 
 Any client protocol can be paired with any host protocol — 16 combinations. Protocol detection is
 automatic by default: the relay reads the host's protocol from LAN discovery (`ServerData` v5/v6/v7),
@@ -164,11 +172,13 @@ off" does **not** prove `X` was the cause — a client that receives no terrain 
 
 Honest scope, because "it builds" and "it works" are different claims.
 
-- **Wire/model level:** 16 protocol pairs × 7 checks = **112 checks, all passing** after the fixes
+- **Wire/model level:** 16 protocol pairs × 8 checks = **128 checks, all passing** after the fixes
   recorded in [`docs/xvrelay-protocol-matrix-2026-10-26.md`](docs/xvrelay-protocol-matrix-2026-10-26.md).
   The checks cover `StartGame` metadata/rules/experiments/permissions, inline `LevelChunk`,
-  request-mode `LevelChunk`, `SubChunk` payload and offsets, host chat, the inventory envelope and
-  client `SubChunkRequest`.
+  request-mode `LevelChunk`, `SubChunk` payload and offsets, host chat, the inventory envelope,
+  client `SubChunkRequest`, and `UpdateBlock` codec→relay→codec round-tripping.
+  `make matrix` prints the per-pair count and writes `dist/matrix.json`; the last run reported
+  `checks=8` with no findings for all 16 pairs.
 - **Registry level:** every block state in the three pinned palettes is checked for identity mapping,
   and every unsupported state is asserted to produce the visible placeholder.
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
@@ -185,6 +195,13 @@ Honest scope, because "it builds" and "it works" are different claims.
 - **Terrain, block updates and clicked-block IDs** are translated. Item semantics across versions,
   recipes, biome schemas, entity metadata, block-entity NBT, particles and arbitrary add-on content
   are separate problems and are **not** solved here.
+- **Ingress is RakNet only.** Clients reach the relay over RakNet; NetherNet is used for LAN discovery
+  (UDP 7551) and for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`). A client
+  that can only speak NetherNet — for example one joining through an activity handle instead of the
+  LAN list — cannot connect. This is a design boundary, not a bug.
+- **Resource-pack prefetch is disabled** (`if false` before `prefetchHostPacks`): hosts were observed
+  misreporting pack sizes, which made the download hang. Packs are still served to the client from the
+  most recent host dial; only the pre-dial is off.
 - **Custom block states** are only handled when they carry explicit typed state properties with
   hashing enabled; runtime-ID ordering of a custom palette is rejected rather than guessed.
 - **Protocol IDs are not a promise.** Two builds can share `2193` and still differ in registry
@@ -242,6 +259,11 @@ The compatibility matrix test is opt-in and writes a report:
 ```bash
 make matrix        # or: XVER_MATRIX_REPORT=dist/matrix.json go test ./cmd/xvrelay -run TestProtocolCompatibilityMatrix -v
 ```
+
+A relative report path is resolved against the module root (not the package directory the Go
+toolchain runs the test in) and its parent directory is created if missing, so this works in a fresh
+clone where `dist/` does not exist yet. The test **skips** when `XVER_MATRIX_REPORT` is unset, so a
+plain `go test ./...` does not run it — silence there is not a pass.
 
 ### Platform status
 
