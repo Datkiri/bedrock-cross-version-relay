@@ -366,9 +366,10 @@ index; the detailed numbers and boundaries live in the linked sections above.
 | #22 | Resource-pack prefetch + per-dial cost guard (`CONN-005`) | `7ba352d` / `42018501074` | host size lie `594 B declared` vs `734 B real`; prefetch 1 pack in `7.97 s`; budget abort in `35 ms` vs `report` with `overruns=1`; default skip downloads 0 |
 | #23 | Semantic packet coverage audit (`PROTO-005`) | `400932c` / `42022254603` | **10** item-stack families + `ItemRegistry` remapped; `CraftingData` keeps **8 of 11** recipe slices; 5 payload families forwarded unchanged; `ItemStackRequest/Response` carry **0** runtime IDs |
 | #24 | NetherNet / WebRTC LAN ingress (`CONN-002`) | `b752d5d` / `42028122424` | full loopback: LAN discovery, `CONNECTREQUEST` → `CONNECTRESPONSE`, ICE/DTLS/SCTP, Login, `StartGame`, `Text` round trip; **3/3** runs at ~2 s each |
+| #26 | Census extractor covers all 8 H2C families + direction audit of the 10 codec families | `58691e0` / `42030933432` | `stacksFrom()` now handles **8/8 H2C** families; the other 2 are **C2H** and provably cannot reach a client. Re-measured 4 protocols `5118/5121/5120/5620`, `lost=0 unknown=0 ok=true`; `AddPlayer` / `MobArmourEquipment` never occur in the 1-player lab, so the wider extractor does not inflate the count |
 
-Only #19, the live parts of #21, and #22 needed the BDS lab; #20, #23, #24 and the #21 loopback
-harness are fully offline. CI runs `go build`, `go vet` and `go test ./...` (including all new
+Only #19, the live parts of #21, #22 and #26 needed the BDS lab; #20, #23, #24 and the #21
+loopback harness are fully offline. CI runs `go build`, `go vet` and `go test ./...` (including all new
 offline harnesses) but deliberately does **not** run benchmarks or the four opt-in tests gated by
 `XVER_MATRIX_REPORT` / `XVER_TERRAIN_CAPTURE` / captured payloads. A full
 `CGO_ENABLED=1 go test -race -buildvcs=false ./... -count=1` also passes locally on all six
