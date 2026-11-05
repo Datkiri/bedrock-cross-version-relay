@@ -226,6 +226,20 @@ Honest scope, because "it builds" and "it works" are different claims.
   not dropped, plain `New()` is a pass-through control, unknown IDs become AIR, and `resolveProto()`
   really returns a registry-aware adapter. Measured: 259 differing IDs / 1717 identical IDs among
   the 1976 shared names; 2076 native entries → 1976 emitted.
+- **Invisible-item audit (offline, wire-level):** `cmd/itemaudit` pushes every native `2193` item
+  through the real client codec, encodes the packet with that protocol's writer, then decodes it
+  with its own packet pool/reader — the same path `Conn.ReadPacket` uses. `NetworkID=0` after the
+  round trip means the client decodes AIR. Measured 2026-11-05: `1001` → **143** invisible of 2076,
+  `2168`/`2169` → **100**, `2193` → **0**, `wrong_id=0` everywhere, and the lost set matches
+  `MappingReport().ItemFallbacks` exactly (143 for `1001`, 100 for `2169`; `2168` does not export
+  that report, so its wire measurement is the direct evidence). The missing items are the 16-colour
+  `concrete_slab` / `concrete_double_slab` / `concrete_stairs` / `wool_slab` / `wool_double_slab` /
+  `wool_stairs` families, plus `cushion`, the `poplar` wood set, `photo_item`, `portfolio`,
+  `shelf_mushroom` and `straw_bed` on `1001`. `go run ./cmd/itemaudit -json dist/item-audit.json`
+  writes the complete name/ID list; `cmd/itemaudit/main_test.go` pins the counts and the
+  protocol-1001 `translatedPacket` wire trap. This is still **not** a real client rendering an
+  inventory: Cinnabar is a GUI client (`make play`) pinned to protocol 2225 and licensed PolyForm
+  Noncommercial, so it cannot be used as a headless multi-version harness.
 - **Live self-check (headless):** `cmd/selfcheck` is an independent terminal Bedrock client. It
   dials the relay's RakNet listener, spawns, counts 18 packet families, checks `GameData().Items`
   against the expected table, samples heap/goroutines, supports `-reconnect` and `-soak`, writes a
@@ -271,7 +285,17 @@ Honest scope, because "it builds" and "it works" are different claims.
   is asserted offline in `item_gameplay_test.go` (both directions, six packet families, no drops,
   non-native input dropped). What has **not** been done is a real Bedrock client visually confirming
   an inventory item; `-map-gameplay-items=false` exists to bisect that if it ever regresses. An
-  unknown runtime ID is replaced by AIR (`hideUnknown=true`) rather than dropped.
+  unknown runtime ID is replaced by AIR (`hideUnknown=true`) rather than dropped. Instead of leaving
+  that as a vague caveat, `cmd/itemaudit` now logs **by name** exactly which items become AIR for
+  each protocol (143 / 100 / 100 / 0) and cross-checks the list against the adapter's own mapper
+  fallbacks — see "What is actually verified". The honest boundary remains: no real client has
+  looked at the inventory.
+- **Item runtime IDs are int16 on the wire.** `protocol.ItemInstance` writes `NetworkID` with
+  `Int16`: an out-of-range probe `900001` decodes as `-17503` even through the identity `2193`
+  codec, while in-range unknown IDs (`20000`) survive unchanged. Custom/add-on item IDs outside
+  `[-32768, 32767]` therefore cannot survive the wire at all, independently of the relay.
+  `cmd/itemaudit` logs this case separately (`WIRE_INT16_TRUNCATION`) so it is not mistaken for
+  a missing item.
 - **Ingress is RakNet only.** Clients reach the relay over RakNet; NetherNet is used for LAN discovery
   (UDP 7551) and, by default, for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`).
   `-host-raknet` replaces that host leg with a plain RakNet dial for a BDS configured with
@@ -313,6 +337,7 @@ cmd/xvrelay/                 the relay: listener, dialer, spawn gate, translatio
 cmd/xvrelay/audit.go         re-parse client-bound chunks, check state IDs against the target registry
 cmd/xvrelay/host_recipes1001.go  recipe / movement-bitset handling for 1001 hosts
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
+cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
 internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address)
@@ -332,6 +357,7 @@ make build     # host binary -> dist/xvrelay
 make test      # go test ./...
 make vet
 make selfcheck # headless self-check client -> dist/selfcheck
+make itemaudit # offline invisible-item audit -> dist/itemaudit
 make release   # linux/amd64, linux/arm64, linux/arm, windows/amd64, darwin/amd64, darwin/arm64
 ```
 
@@ -365,9 +391,30 @@ toolchain runs the test in) and its parent directory is created if missing, so t
 clone where `dist/` does not exist yet. The test **skips** when `XVER_MATRIX_REPORT` is unset, so a
 plain `go test ./...` does not run it — silence there is not a pass.
 
+### Invisible-item audit
+
+`cmd/itemaudit` is offline and needs no BDS, listener, account or GUI client. It logs every item
+that becomes AIR (`NetworkID=0`) for each client protocol and writes the full list as JSON:
+
+```bash
+make itemaudit                                    # build -> dist/itemaudit
+go run ./cmd/itemaudit -limit 20                  # first 20 INVISIBLE lines per protocol
+go run ./cmd/itemaudit -proto 2169 -json dist/item-audit.json
+go run ./cmd/itemaudit -fail-on-loss             # non-zero exit if anything is invisible (opt-in)
+```
+
+Output on the pinned data (2026-11-05): `TOTAL lost=343 target_only=0 protocols=4`, i.e.
+`1001` = 143, `2168` = 100, `2169` = 100, `2193` = 0, with `wrong_id=0` for every protocol and
+`visible + lost = 2076` in each. The `1001` and `2169` adapters' `MappingReport().ItemFallbacks`
+match the measured AIR set exactly (`cross_check="OK: 143 ..."` / `"OK: 100 ..."`); `2168` wraps
+`2169` without exporting that report, so its wire measurement is the evidence. `cmd/itemaudit/main_test.go`
+runs this as a normal `go test ./...` regression, including the protocol-1001 `translatedPacket`
+trap: decoding its `InventoryContent` into a plain latest packet leaves 30219 unread bytes, while
+decoding through `codec.Packets(false)` leaves 0.
+
 Measured baseline (2026-11-05, CGO disabled): `go build -buildvcs=false ./...`,
-`go vet ./...`, `go test -buildvcs=false ./...` all pass, including `cmd/selfcheck` and the five
-`item_gameplay_test.go` assertions; all six release targets cross-compile
+`go vet ./...`, `go test -buildvcs=false ./...` all pass, including `cmd/selfcheck`,
+`cmd/itemaudit` and the five `item_gameplay_test.go` assertions; all six release targets cross-compile
 (`linux amd64/arm64/arm`, `windows amd64`, `darwin amd64/arm64`);
 `go test -race ./cmd/xvrelay ./internal/blocktranslate` passes with CGO enabled. Four tests are
 opt-in and skip by default: `TestProtocolCompatibilityMatrix` (`XVER_MATRIX_REPORT`),
