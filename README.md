@@ -248,7 +248,8 @@ Honest scope, because "it builds" and "it works" are different claims.
   reference for the separate MIT terminal client `cmd/clientclone` described below.
 - **Live self-check (headless):** `cmd/selfcheck` is an independent terminal Bedrock client. It
   dials the relay's RakNet listener, spawns, counts 18 packet families, checks `GameData().Items`
-  against the expected table, samples heap/goroutines, supports `-reconnect` and `-soak`, writes a
+  against the expected table, samples heap/goroutines/`num_gc`, supports `-reconnect` and
+  `-soak`, writes a
   JSON report and exits non-zero on a failed assertion. Against a real BDS 1.26.33.1 host
   (`transport=raknet`, reached with `-host-raknet 127.0.0.1:19132 -host-proto 1001`) the final
   uniform run on the fixed binary (`-client-proto auto`, `-soak 4s`) gave all four protocols
@@ -273,6 +274,20 @@ Honest scope, because "it builds" and "it works" are different claims.
   205 KB**, a ~2 KB sub-chunk rewrite **~1.2 µs / 5.5 KB**, and the per-session block mapper
   build **~660 µs / 609 KB** — which is why it is cached behind `sync.Once`. This is
   **per-operation cost, not process-level CPU or end-to-end latency**; see "Hot-path benchmarks".
+- **Concurrency / lifecycle (`CONN-004`, measured 2026-11-05):** `cmd/xvrelay/concurrency_test.go`
+  drives **8 real loopback RakNet sessions at once** over `sessions`, `clientGates`,
+  `spawnCapture` and `clientGate` atomics, asserting each session resolves its own state, emits
+  its own captured prelude bytes, keeps its own packet counter, and leaves both global maps back
+  at baseline after cleanup. `CGO_ENABLED=1 go test -race -run TestConcurrent` is clean. Live on
+  BDS 1.26.33.1 (`transport=raknet`, `-host-raknet 127.0.0.1:19132 -host-proto 1001`):
+  `selfcheck -reconnect 3 -soak 4s` → **4/4 sessions `OK=true`** (1324 / 1217 / 1174 / 1142
+  packets, 921 chunks each, `registry=true`, `soak_complete`); **3 concurrent clients** on
+  `1001`/`2169`/`2193` → **3/3 `OK=true`**; the same run against a relay **built with `-race`**
+  reported **0 `DATA RACE`**. A 25 s soak held goroutines at 5→7→6 with `num_gc` 4→7 then flat.
+  Two honest boundaries: (1) `dialHost()` holds `hostProtoMu` for the whole host dial, so the
+  three clients spawned ~9 s apart (17:41:59 / 17:42:08 / 17:42:17) — throughput is serialised,
+  not racy; (2) `heap_alloc` still grows ~0.04 MB/s in steady state with GC count flat, so a
+  small retained-heap trend is **not** ruled out without an hours-long soak.
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, resource packs, biomes, entity
@@ -349,8 +364,11 @@ Honest scope, because "it builds" and "it works" are different claims.
     `ConnectionType=4`) but a direct `go-nethernet` dial sent `CONNECTREQUEST` and received **no**
     `CONNECTRESPONSE` (25 s `context deadline exceeded`). `-host-raknet` is the measured workaround,
     not a NetherNet implementation.
-  - `CONN-004` — the self-check harness supports `-reconnect N` and `-soak <duration>`; a
-    multi-client, hours-long soak has **not** been run.
+  - `CONN-004` — short reconnect (`-reconnect 3`, 4/4 OK), 3-client concurrency (3/3 OK),
+    `-race` on both the offline harness and the live relay (0 races), and a 25 s soak are now
+    **measured** (see "Concurrency / lifecycle"). Still **not** run: a multi-client, hours-long
+    soak; `heap_alloc` grows ~0.04 MB/s in steady state with `num_gc` flat, so a small
+    retained-heap trend cannot be excluded. Host dials are also serialised by `hostProtoMu`.
   - `CONN-005` — pack prefetch stays off; the self-check observed `ResourcePackStack/DataInfo/
     ChunkData = 0/0/0` on a pack-free BDS, so the pack edge cases are untested.
   - `PROTO-005` — **item runtime IDs** inside crafting / creative / inventory packets ARE mapped and
@@ -375,6 +393,7 @@ cmd/xvrelay/host_recipes1001.go  recipe / creative-item / movement-bitset handli
 cmd/xvrelay/host_creative1001_test.go  pins host-1001 creative IDs -> native 2193 IDs
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
 cmd/xvrelay/bench_test.go        hot-path benchmarks (codec / item / chunk) + fixture validity test
+cmd/xvrelay/concurrency_test.go  8-session loopback concurrency / isolation / leak / race harness
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
@@ -410,6 +429,13 @@ export CGO_ENABLED=0
 go build -buildvcs=false -trimpath -o dist/xvrelay ./cmd/xvrelay
 go vet ./...
 go test ./...
+```
+
+The concurrency harness can additionally be run under the race detector. This is the one command
+that needs CGO and a C compiler (it is not part of `make test`):
+
+```bash
+CGO_ENABLED=1 go test -race -buildvcs=false ./cmd/xvrelay -run TestConcurrent -count=1
 ```
 
 `-buildvcs=false` matters when this tree sits inside another git work tree.

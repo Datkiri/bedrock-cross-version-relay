@@ -72,6 +72,9 @@ type heapSample struct {
 	OffsetMS       int64  `json:"offset_ms"`
 	HeapAllocBytes uint64 `json:"heap_alloc_bytes"`
 	NumGoroutine   int    `json:"num_goroutine"`
+	// NumGC distinguishes a real retained-heap leak from plain GC pacing: if Alloc keeps
+	// rising while NumGC also rises, live objects are actually accumulating.
+	NumGC uint32 `json:"num_gc"`
 }
 
 type assertion struct {
@@ -363,6 +366,7 @@ func runSession(cfg config, codec minecraft.Protocol, index int) session {
 			OffsetMS:       time.Since(start).Milliseconds(),
 			HeapAllocBytes: m.Alloc,
 			NumGoroutine:   runtime.NumGoroutine(),
+			NumGC:          m.NumGC,
 		})
 		sampleMu.Unlock()
 	}
