@@ -1484,7 +1484,7 @@ func relay(from, to *minecraft.Conn, dir string, trace int) {
 		}
 		if err := writeSafe(to, pk); err != nil {
 			// RULE: one packet that fails to encode must NOT kill the session.
-			if connDead(err) {
+			if connDead(err, to.Context()) {
 				slog.Info("xvrelay: relay write end (destination closed)", "dir", dir, "packets", n, "error", err)
 				logTally(dir, tally, skipped)
 				return
@@ -1518,9 +1518,20 @@ func writeSafe(to *minecraft.Conn, pk packet.Packet) (err error) {
 }
 
 // connDead reports whether a write error came from the DESTINATION already being closed.
-func connDead(err error) bool {
-	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) ||
-		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+//
+// A NetherNet/WebRTC peer whose SCTP transport closed reports a PLAIN error
+// ("nethernet: SCTP transport closed", go-nethernet/conn.go handleTransports).
+// It wraps no sentinel, so errors.Is cannot see it. Without the context check
+// the H->C loop kept writing into a dead client after C->H had already ended,
+// emitting hundreds of "dropped 1 packet, session kept" WARNs per disconnect.
+// minecraft.Conn.ctx is derived from nethernet.Conn.Context() and is canceled on
+// close, so this check is transport-independent for RakNet and NetherNet alike.
+func connDead(err error, dst context.Context) bool {
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return dst != nil && dst.Err() != nil
 }
 
 // logTally prints the per-type packet counter, descending.
@@ -3049,6 +3060,10 @@ func main() {
 	// NetherNet/WebRTC. gophertunnel exposes the latter through ListenNetwork with
 	// a minecraft.NetherNet Network; the SAME lansignal.Signaling that discovers
 	// and dials the host doubles as the signaling backend for incoming offers.
+	// ls.Ingress() gives the listener a filtered view: signals belonging to our
+	// own outbound host dial (CONNECTRESPONSE / CANDIDATEADD) never reach the
+	// listener's notifier, so go-nethernet does not log
+	// "received non-offer signal for a non-existing negotiation" for every join.
 	// minecraft.Listener.Accept() still yields *minecraft.Conn, so the session
 	// pipeline below is transport-agnostic.
 	var listener *minecraft.Listener
@@ -3058,7 +3073,7 @@ func main() {
 		transport = "nethernet"
 		nnLog := slog.Default().With("link", "nethernet-ingress")
 		listener, err = listenCfg.ListenNetwork(minecraft.NetherNet{
-			Signaling: ls,
+			Signaling: ls.Ingress(),
 			ListenConfig: nethernet.ListenConfig{
 				// LAN / self-signed clients send no 'a=identity' assertion in
 				// their offer. The Minecraft layer already has

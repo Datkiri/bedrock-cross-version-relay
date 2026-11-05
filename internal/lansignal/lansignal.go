@@ -91,6 +91,14 @@ type Signaling struct {
 	notifiers   map[uint32]nethernet.Notifier
 	notifyCount uint32
 
+	// dialTargets holds the network IDs of worlds we have sent an OFFER to.
+	// A CONNECTRESPONSE / CANDIDATEADD from one of those peers is an answer to
+	// our own outbound dial, not a client connecting to us. See Ingress below:
+	// without this split, a single Signaling shared between the host dial and
+	// the NetherNet listener makes go-nethernet log
+	// "received non-offer signal for a non-existing negotiation" (CONN-002).
+	dialTargets sync.Map // uint64 -> struct{}
+
 	closed    chan struct{}
 	closeOnce sync.Once
 }
@@ -333,6 +341,56 @@ func (s *Signaling) Notify(n nethernet.Notifier) (stop func()) {
 	})
 }
 
+// IsDialTarget reports whether networkID belongs to a world we have sent an
+// OFFER to. Incoming signals from such a peer are answers to our own outbound
+// dial, never offers from a client.
+func (s *Signaling) IsDialTarget(networkID string) bool {
+	id, err := strconv.ParseUint(networkID, 10, 64)
+	if err != nil {
+		return false
+	}
+	_, ok := s.dialTargets.Load(id)
+	return ok
+}
+
+// Ingress returns a Signaling view suitable for a nethernet.Listener
+// (CONN-002). Everything else is delegated to s, but notifiers registered
+// through this view never see signals belonging to one of our own outbound
+// world dials.
+//
+// Why it is needed: the relay reuses ONE Signaling both to dial the LAN world
+// and to accept clients over NetherNet. deliver() broadcasts every received
+// signal to every notifier. go-nethernet's dialer already filters by its own
+// connection ID and stays quiet, but Listener.NotifySignal logs at ERROR level
+// for any non-offer signal with no matching negotiation. The host's
+// CONNECTRESPONSE therefore produced a spurious ERROR for every client
+// session. Filtering at registration is the root-cause fix: outbound-dial
+// traffic is simply not listener traffic.
+func (s *Signaling) Ingress() nethernet.Signaling {
+	return ingressSignaling{Signaling: s}
+}
+
+type ingressSignaling struct{ *Signaling }
+
+func (s ingressSignaling) Notify(n nethernet.Notifier) (stop func()) {
+	return s.Signaling.Notify(ingressNotifier{Notifier: n, sig: s.Signaling})
+}
+
+type ingressNotifier struct {
+	nethernet.Notifier
+	sig *Signaling
+}
+
+func (n ingressNotifier) NotifySignal(s *nethernet.Signal) bool {
+	if n.sig.IsDialTarget(s.NetworkID) {
+		// Silently claim the signal: it belongs to the host dial, not to a
+		// client of this listener. Returning true keeps deliver() from logging
+		// a rejection too.
+		return true
+	}
+	return n.Notifier.NotifySignal(s)
+}
+
 // Signal delivers a signal to the peer with the given network ID. The address is
 // the one recorded when that peer last sent us a packet.
 func (s *Signaling) Signal(ctx context.Context, signal *nethernet.Signal) error {
@@ -347,6 +405,11 @@ func (s *Signaling) Signal(ctx context.Context, signal *nethernet.Signal) error 
 	id, err := strconv.ParseUint(signal.NetworkID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("parse network ID %q: %w", signal.NetworkID, err)
+	}
+	if signal.Type == nethernet.SignalTypeOffer {
+		// This peer is a world WE are dialling. Remember it so Ingress() can
+		// keep its answers/candidates away from the client-facing listener.
+		s.dialTargets.Store(id, struct{}{})
 	}
 
 	s.peersMu.RLock()

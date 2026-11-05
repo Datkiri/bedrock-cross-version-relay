@@ -92,14 +92,15 @@ func TestNetherNetIngressLoopback(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// The exact construction used by -listen-nethernet in main().
+	// The exact construction used by -listen-nethernet in main(), including
+	// the Ingress() view so the loopback also exercises the dial-target filter.
 	listener, err := (minecraft.ListenConfig{
 		AuthenticationDisabled: true,
 		ErrorLog:               log,
 		AllowUnknownPackets:    true,
 		AllowInvalidPackets:    true,
 	}).ListenNetwork(minecraft.NetherNet{
-		Signaling: relaySig,
+		Signaling: relaySig.Ingress(),
 		ListenConfig: nethernet.ListenConfig{
 			AllowAnonymous: true, // LAN/self-signed clients send no identity assertion.
 			Log:            log,

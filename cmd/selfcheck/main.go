@@ -1,9 +1,13 @@
 // Command selfcheck is a headless terminal Bedrock client used to independently
-// exercise a running xvrelay RakNet listener. It connects with a selectable
-// client protocol, spawns, counts gameplay packets and writes a JSON report.
+// exercise a running xvrelay listener. It connects with a selectable client
+// protocol, spawns, counts gameplay packets and writes a JSON report.
 //
-// It deliberately does not talk to the real game, Xbox Live or any GUI: it is
-// the independent client used in place of a game client for live measurements.
+// Two ingress paths are supported: the default RakNet dial (-addr), and
+// -lan-join, which discovers the relay's world card on UDP 7551 and joins over
+// NetherNet/WebRTC exactly like a game client using the LAN world list
+// (CONN-002). It deliberately does not talk to the real game, Xbox Live or any
+// GUI: it is the independent client used in place of a game client for live
+// measurements.
 package main
 
 import (
@@ -12,15 +16,21 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 
 	"bedrock-cross-version-relay/internal/blocktranslate"
+	"bedrock-cross-version-relay/internal/lansignal"
 
+	"github.com/df-mc/go-nethernet"
 	"github.com/google/uuid"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
@@ -53,6 +63,14 @@ type config struct {
 	reconnect    int
 	jsonPath     string
 	verbose      bool
+
+	// LAN/NetherNet join (CONN-002): when lanJoin is true selfcheck behaves like
+	// a real game client — it discovers the relay's world card on UDP 7551 and
+	// dials its network ID over WebRTC instead of dialling RakNet on -addr.
+	lanJoin    bool
+	lanAddr    string
+	networkID  string
+	lanTimeout time.Duration
 }
 
 var verbose bool
@@ -217,7 +235,13 @@ func isDeadline(err error) bool {
 
 // dialRelay bounds the dial both by ctx and by a hard wall-clock limit, so a
 // missing/unreachable relay always produces a clear error instead of a hang.
-func dialRelay(ctx context.Context, cfg config, codec minecraft.Protocol, name string) (*minecraft.Conn, error) {
+// The returned cleanup (if any) must stay alive until the session finished
+// reading: for a LAN join it owns the signalling socket that carries the
+// WebRTC negotiation and the data channel.
+func dialRelay(ctx context.Context, cfg config, codec minecraft.Protocol, name string) (*minecraft.Conn, func(), error) {
+	if cfg.lanJoin {
+		return dialLAN(ctx, cfg, codec, name)
+	}
 	d := minecraft.Dialer{
 		Protocol:                   codec,
 		ClientData:                 login.ClientData{GameVersion: codec.Ver()},
@@ -236,9 +260,157 @@ func dialRelay(ctx context.Context, cfg config, codec minecraft.Protocol, name s
 	hard := cfg.spawnTimeout + 500*time.Millisecond
 	select {
 	case r := <-ch:
-		return r.conn, r.err
+		return r.conn, nil, r.err
 	case <-time.After(hard):
-		return nil, fmt.Errorf("hard dial timeout after %s: no listener at %s", hard, cfg.addr)
+		return nil, nil, fmt.Errorf("hard dial timeout after %s: no listener at %s", hard, cfg.addr)
+	}
+}
+
+// lanNetwork decouples the NetherNet network ID from ClientData.ServerAddress.
+// gophertunnel's DialContextNetwork reuses ONE string for both
+// Network.DialContext and ClientData.ServerAddress, and the listener validates
+// ServerAddress as a resolvable UDP address. A decimal network ID (what LAN
+// discovery gives us) fails that validation, so DialContext is overridden to
+// use the real network ID while the dial address stays a valid IP:port.
+// Real game clients send their own IP:port in ServerAddress and dial the
+// network ID out of band; only this headless client needs the shim.
+type lanNetwork struct {
+	minecraft.NetherNet
+	networkID string
+}
+
+func (n lanNetwork) DialContext(ctx context.Context, _ string) (net.Conn, error) {
+	return n.NetherNet.DialContext(ctx, n.networkID)
+}
+
+// isLocalDiscoveryAddr reports whether a LAN peer answered from this machine's
+// own IP (or loopback) on the discovery port. The relay's ResponsePacket is
+// sourced from the outbound interface IP even when we probed 127.0.0.1, so
+// matching the -lan-addr string exactly is too strict; other LAN worlds (the
+// host machine) have a different IP and must NOT be dialled by mistake.
+// When the relay runs on another machine, pass -network-id explicitly.
+func isLocalDiscoveryAddr(a net.Addr, port int) bool {
+	u, ok := a.(*net.UDPAddr)
+	if !ok || u.Port != port {
+		return false
+	}
+	if u.IP.IsLoopback() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, ia := range addrs {
+		if ipnet, ok := ia.(*net.IPNet); ok && ipnet.IP.Equal(u.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+// dialLAN is the CONN-002 path: discover the relay's advertised world on UDP
+// 7551, then join it over NetherNet/WebRTC exactly as a LAN game client would.
+func dialLAN(ctx context.Context, cfg config, codec minecraft.Protocol, name string) (*minecraft.Conn, func(), error) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if verbose {
+		log = slog.Default()
+	}
+	relayAddr, err := net.ResolveUDPAddr("udp", cfg.lanAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bad -lan-addr %q: %w", cfg.lanAddr, err)
+	}
+
+	// Bind an ephemeral socket: the relay already owns UDP 7551 on this machine.
+	// ExtraBroadcasts sends our RequestPacket directly to the relay's socket.
+	ls, err := lansignal.Listen(lansignal.Options{
+		Addr:            "0.0.0.0:0",
+		Log:             log,
+		ExtraBroadcasts: []*net.UDPAddr{relayAddr},
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("LAN signalling socket: %w", err)
+	}
+	cleanup := func() { _ = ls.Close() }
+
+	id := cfg.networkID
+	if id == "" {
+		deadline := time.Now().Add(cfg.lanTimeout)
+		for id == "" {
+			// Worlds() includes BOTH the relay and any other LAN world (e.g. the
+			// host machine's own world). Pick a peer that answered from this
+			// machine's own IP on the discovery port, otherwise we would dial
+			// the wrong network ID. Exact loopback match is tried first.
+			for _, w := range ls.Worlds() {
+				if w.Addr != nil && w.Addr.String() == relayAddr.String() {
+					id = strconv.FormatUint(w.NetworkID, 10)
+					break
+				}
+			}
+			if id == "" {
+				for _, w := range ls.Worlds() {
+					if w.Addr != nil && isLocalDiscoveryAddr(w.Addr, relayAddr.Port) {
+						id = strconv.FormatUint(w.NetworkID, 10)
+						break
+					}
+				}
+			}
+			if id != "" || time.Now().After(deadline) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return nil, cleanup, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	if id == "" {
+		seen := make([]string, 0)
+		for _, w := range ls.Worlds() {
+			seen = append(seen, fmt.Sprintf("%d@%v", w.NetworkID, w.Addr))
+		}
+		return nil, cleanup, fmt.Errorf("no LAN world advertised by %s within %s (is the relay running with -listen-nethernet?); peers seen: %v",
+			cfg.lanAddr, cfg.lanTimeout, seen)
+	}
+	vlog("session: LAN discovered relay network_id=%s addr=%s", id, cfg.lanAddr)
+
+	d := minecraft.Dialer{
+		Protocol:                   codec,
+		ClientData:                 login.ClientData{GameVersion: codec.Ver()},
+		IdentityData:               login.IdentityData{DisplayName: name, Identity: uuid.New().String()},
+		DisconnectOnUnknownPackets: false,
+		ErrorLog:                   log,
+	}
+	type result struct {
+		conn *minecraft.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, err := d.DialContextNetwork(ctx, lanNetwork{
+			NetherNet: minecraft.NetherNet{
+				Signaling: ls,
+				Log:       log,
+				Dialer: nethernet.Dialer{
+					// The relay is self-signed / anonymous (AllowAnonymous=true).
+					AllowIdentitylessServer: true,
+					DisableTrickleICE:       true,
+				},
+			},
+			networkID: id,
+		}, "127.0.0.1:19132")
+		ch <- result{conn: c, err: err}
+	}()
+	hard := cfg.spawnTimeout + 500*time.Millisecond
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, cleanup, r.err
+		}
+		return r.conn, cleanup, nil
+	case <-time.After(hard):
+		return nil, cleanup, fmt.Errorf("hard LAN dial timeout after %s (network_id=%s)", hard, id)
 	}
 }
 
@@ -285,10 +457,21 @@ func runSession(cfg config, codec minecraft.Protocol, index int) session {
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), cfg.spawnTimeout)
 	defer dialCancel()
 
-	vlog("session %d: dialing %s as protocol %d (%s)", index+1, cfg.addr, cfg.proto, codec.Ver())
-	conn, err := dialRelay(dialCtx, cfg, codec, name)
+	if cfg.lanJoin {
+		vlog("session %d: joining over NetherNet LAN discovery (%s) as protocol %d (%s)", index+1, cfg.lanAddr, cfg.proto, codec.Ver())
+	} else {
+		vlog("session %d: dialing %s as protocol %d (%s)", index+1, cfg.addr, cfg.proto, codec.Ver())
+	}
+	conn, cleanup, err := dialRelay(dialCtx, cfg, codec, name)
+	if cleanup != nil {
+		defer cleanup()
+	}
 	if err != nil {
-		s.Error = fmt.Sprintf("dial %s: %v", cfg.addr, err)
+		target := cfg.addr
+		if cfg.lanJoin {
+			target = cfg.lanAddr + " (nethernet LAN join)"
+		}
+		s.Error = fmt.Sprintf("dial %s: %v", target, err)
 		s.DisconnectReason = s.Error
 		setCheck("connect", false, s.Error)
 		reason := "skipped: connect failed"
@@ -495,6 +678,10 @@ func run() int {
 		reconnect    = flag.Int("reconnect", 0, "number of additional reconnects after the initial session (total = 1 + N)")
 		jsonPath     = flag.String("json", "", "write the JSON session report to this path")
 		verboseFlag  = flag.Bool("v", false, "verbose logging to stderr")
+		lanJoin      = flag.Bool("lan-join", false, "CONN-002: join over NetherNet/WebRTC LAN discovery like a game client (requires the relay to run with -listen-nethernet); -addr is ignored")
+		lanAddr      = flag.String("lan-addr", "127.0.0.1:7551", "UDP signalling address of the relay when -lan-join is set")
+		networkID    = flag.String("network-id", "", "relay network ID for -lan-join (empty = discover it from the relay's LAN ResponsePacket)")
+		lanTimeout   = flag.Duration("lan-timeout", 6*time.Second, "how long to wait for the relay's LAN world card when -lan-join is set")
 	)
 	flag.Parse()
 	verbose = *verboseFlag
@@ -507,6 +694,10 @@ func run() int {
 		reconnect:    *reconnect,
 		jsonPath:     *jsonPath,
 		verbose:      *verboseFlag,
+		lanJoin:      *lanJoin,
+		lanAddr:      *lanAddr,
+		networkID:    *networkID,
+		lanTimeout:   *lanTimeout,
 	}
 	if cfg.spawnTimeout <= 0 || cfg.soak < 0 || cfg.reconnect < 0 {
 		fmt.Fprintln(os.Stderr, "selfcheck: -spawn-timeout must be > 0, -soak and -reconnect must be >= 0")

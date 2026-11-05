@@ -119,11 +119,18 @@ spawns through the relay and reports assertions as JSON:
 ```bash
 go build -buildvcs=false -o dist/selfcheck ./cmd/selfcheck
 ./dist/selfcheck -addr 127.0.0.1:19164 -proto 2193 -soak 10s -json dist/selfcheck-2193.json -v
+
+# CONN-002: join the relay the way a game client selects a LAN world — discover
+# its world card on UDP 7551, then dial that network ID over NetherNet/WebRTC.
+./dist/selfcheck -lan-join -proto 2193 -soak 10s -json dist/selfcheck-lan-2193.json -v
 ```
 
 Useful flags: `-proto` (`1001|2168|2169|2193`), `-reconnect N`, `-soak <duration>`,
-`-spawn-timeout`, `-json <path>`, `-v`. It exits non-zero when any assertion fails, so it can be
-wired into CI. All four protocols have been live-tested against a BDS 1.26.33.1 host; see
+`-spawn-timeout`, `-json <path>`, `-v`. For `-lan-join`: `-lan-addr` (default
+`127.0.0.1:7551`), `-network-id` (skip discovery), `-lan-timeout`. `-lan-join` requires the
+relay to run with `-listen-nethernet`; `-addr` is ignored. It exits non-zero when any assertion
+fails, so it can be wired into CI. All four protocols have been live-tested against a BDS 1.26.33.1
+host and against a real LAN world on another machine; see
 [What is actually verified](#what-is-actually-verified).
 
 Multiple clients of *different* versions can be relayed into the same host at once — spawn capture and
@@ -343,6 +350,18 @@ Honest scope, because "it builds" and "it works" are different claims.
   `internal/lansignal/pong_test.go` pins that a `CONNECTREQUEST` sender is routable for the answer
   and that gophertunnel's MCPE pong string is converted to binary `ServerData` (the LAN world card
   decoded as `Minecraft Server` / `Gophertunnel` in the loopback log). See "NetherNet ingress".
+- **Live two-machine LAN join (measured 2026-11-05):** a real LAN world (`My World` /
+  `Datkiri001`, `192.168.1.119:7551`, protocol `2193`, `network_id=15619059520673756992`) ran on
+  a **different machine**. The relay ran with `-listen-nethernet` and advertised its own world
+  card on UDP 7551; `cmd/selfcheck -lan-join` discovered that card and joined over
+  NetherNet/WebRTC, exactly like a game client picking a LAN world. **13/13 sessions** connected,
+  dialled the world and spawned (`client connected` = `dial world OK` = `client has spawned` =
+  13). Native `2193`: `1251` packets / `921` chunks / `2076` items / `registry=true` /
+  `soak_complete` / `OK=true`. `-reconnect 3` → **4/4** `OK=true`. Sequential
+  `1001`/`2168`/`2169` → **3/3** `OK=true` (`1201/941/953` packets, `1933/1976/1976` items).
+  Relay log after the two fixes below: **`level=ERROR` 0, `dropped 1 packet` 0,
+  `non-offer signal` 0**, and `relay write end (destination closed)` 5 times instead of the
+  previous WARN storm. See "Live LAN join and the two NetherNet fixes".
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, required/encrypted resource
@@ -382,6 +401,13 @@ packages (2026-11-05); race coverage is therefore not limited to the three targe
 - **The client must be signed into Xbox Live.** The vendored `2193` fork does not rescue an empty
   `DisplayName`, so an offline client is rejected at login with
   `DisplayName must not be empty`. A real Microsoft account is required on the client side.
+- **One active upstream connection per LAN world (measured, upstream constraint).** With
+  `-listen-nethernet` the relay dials one NetherNet connection into the LAN world **per client
+  session**. A real LAN world hosted by a game client accepts only one active connection at a
+  time: 2 concurrent `selfcheck -lan-join` clients → 1 succeeded / 1 disconnected after the host
+  closed SCTP; 3 concurrent clients → 2 dropped the same way. All sequential sessions pass
+  (13/13 connected, dialled and spawned). Single-client use — the intended manual-test scenario —
+  is stable. See "Live LAN join and the two NetherNet fixes".
 - **Same-wire sessions were broken until 2026-11-05 — now fixed.** A `1001` client into a `1001`
   BDS host used to log `dial world OK hostProto=1001 clientProto=1001` and then go silent for ~41 s
   before disconnecting itself (`StartGame to the client failed ... context canceled`,
@@ -515,13 +541,15 @@ cmd/xvrelay/packs.go        CONN-005 pack policy + per-dial guard + host-Protoco
 cmd/xvrelay/packs_test.go   policy / budget / real-size lie / overrun abort / skipped-pack tests
 cmd/xvrelay/semantic_coverage_test.go  PROTO-005 measured item/particle/NBT family coverage (offline)
 cmd/xvrelay/nethernet_ingress_test.go  CONN-002 full NetherNet/WebRTC ingress loopback (real ICE + Login + packet)
+cmd/xvrelay/relay_deadconn_test.go  connDead() classifies a closed NetherNet/WebRTC destination via its context
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
-cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
+cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report; -lan-join joins over NetherNet LAN discovery
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
 cmd/clientclone/items.go    live wire item census: extract all 8 H2C item-stack families, resolve IDs, ITEM_VISIBLE / ITEM_LOST / ITEM_UNKNOWN_ID
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
 internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address); also the Signaling backend for -listen-nethernet
 internal/lansignal/pong_test.go  MCPE-pong -> binary ServerData conversion + CONNECTREQUEST/RESPONSE signalling round trip
+internal/lansignal/ingress_test.go  Ingress() keeps outbound-dial signals away from the NetherNet listener
 internal/mcport/          Minecraft port detection helpers
 java/                     JVM port of the translation layer — status and scope in java/README.md
 third_party/              pinned forks of go-nethernet and gophertunnel (protocol 2193 support)
@@ -732,7 +760,7 @@ reuses the existing `ls` instead of opening a second signalling stack:
 
 ```go
 listener, err = listenCfg.ListenNetwork(minecraft.NetherNet{
-    Signaling: ls,
+    Signaling: ls.Ingress(), // filtered view: see "Live LAN join and the two NetherNet fixes"
     ListenConfig: nethernet.ListenConfig{AllowAnonymous: true, Log: nnLog},
     Log: nnLog,
 }, ls.NetworkID())
@@ -750,6 +778,7 @@ Two supporting fixes were needed in `internal/lansignal`:
 | `MessagePacket` now calls `record(senderID, addr, nil)` before `deliver()` | `Signal()` resolves a peer by network ID. A client that only ever sent `CONNECTREQUEST` (never a LAN `RequestPacket`) was previously unroutable → `no address known for network ID`. |
 | `PongData()` converts a `MCPE;...;` pong string to binary `ServerData` | gophertunnel's listener calls `PongData` every 4 s with a RakNet pong **string**, but a LAN `ResponsePacket` carries **binary** `ServerData`. Without conversion the world card is undecodable. Binary input is still passed through unchanged. |
 | `Listen()` allocates network IDs through a process-wide monotonic `atomic.Uint64` seed | `time.Now().UnixNano()` is coarse on Windows: two rapid `Listen()` calls (relay + loopback peer) could receive the **same** network ID, after which each peer discarded the other's packets as "our own broadcast" and `Signal()` could never route the answer back. `pong_test.go` pins 8 rapid instances to distinct IDs. |
+| `Ingress()` gives the listener a filtered `Signaling` view; `Signal()` records every OFFER target as a dial target | One `ls` backs **both** the outbound host dial and the inbound listener. `deliver()` broadcasts every received signal to every notifier, so the host's `CONNECTRESPONSE` reached the listener and `go-nethernet` logged `received non-offer signal for a non-existing negotiation` at ERROR level on every join. `dialerNotifier` already filters by connection ID and stays quiet; only the listener needed routing. `internal/lansignal/ingress_test.go` pins that host answers/candidates reach the dialer but not the listener, while client offers still reach the listener. |
 
 Measured 2026-11-05 with `cmd/xvrelay/nethernet_ingress_test.go` (two `lansignal.Signaling`
 instances on loopback, real WebRTC, no BDS / game client / Xbox service):
@@ -773,15 +802,48 @@ network ID fails that validation (`ServerAddress must be resolveable as a UDP ad
 Bedrock clients send a real `IP:port` in `ServerAddress` and dial the network ID out of band, so
 only the loopback dialer needs the `fixedIDNetherNet` shim in the test.
 
-Honest boundaries: (1) this is a **loopback** with two synthetic signalling peers — a real
-Minecraft game client joining through the LAN list, and NetherNet ingress across two physical
-machines, are **not** verified. (2) `AllowAnonymous: true` means no `Xbox Live identity assertion`
+Honest boundaries: (1) the loopback above is two synthetic signalling peers; the **real game
+client (GUI)** joining from the LAN world list is still not verified — the live test below uses
+the headless `cmd/selfcheck`. (2) `AllowAnonymous: true` means no `Xbox Live identity assertion`
 is enforced at the NetherNet layer; the Minecraft layer is `AuthenticationDisabled: true` too.
 (3) The **host-side** boundary is unchanged: a BDS with `transport=nethernet` still does not
 answer our outbound dial, which is why `-host-raknet` remains the measured workaround.
 (4) With `-listen-nethernet` combined with `-host-raknet`, the discovery socket binds UDP 7551
 and broadcasts `RequestPacket`s (it is muted/ephemeral in plain direct-host mode), so the relay
 is visible on the LAN.
+
+#### Live LAN join and the two NetherNet fixes
+
+Measured 2026-11-05 against a **real LAN world on another machine** (`My World` / `Datkiri001`,
+`192.168.1.119:7551`, protocol `2193`, `network_id=15619059520673756992`). Relay:
+`./dist/xvrelay -timeout 25s -trace 0 -listen-nethernet`; client:
+`./dist/selfcheck -lan-join -proto 2193 -soak 5s`. The relay advertised its own world card
+(`network_id=1793885200784033600`) and `selfcheck` discovered it on UDP 7551, then dialled it
+over WebRTC instead of RakNet — the same path a game client takes when it picks a LAN world.
+`isLocalDiscoveryAddr` accepts the relay's `ResponsePacket` from `192.168.1.219:7551` even when
+`127.0.0.1:7551` was probed, while still ignoring the other machine's world card.
+
+Two real defects surfaced only under this live path and were fixed at the root cause:
+
+| Symptom (before) | Root cause | Fix |
+| --- | --- | --- |
+| `level=ERROR received non-offer signal for a non-existing negotiation` with a `CONNECTRESPONSE` from the host's network ID, once per join | One `lansignal.Signaling` backs both the outbound host dial and the inbound listener; `deliver()` fanned the host's answer out to the listener's notifier, which has no negotiation for that connection ID | `ls.Ingress()` + `dialTargets`: `Signal()` records every OFFER target, and the listener's notifier silently claims signals from those peers. `internal/lansignal/ingress_test.go` |
+| `WARN dropped 1 packet, session kept ... nethernet: SCTP transport closed` repeated **592 times** in one relay log after clients disconnected | `connDead()` used only `errors.Is`; go-nethernet reports a closed SCTP transport as a plain `errors.New("nethernet: SCTP transport closed")` that wraps no sentinel, so the H→C loop kept writing into a dead client | `connDead(err, dst)` also checks `dst.Err() != nil`. `minecraft.Conn.ctx` is derived from `nethernet.Conn.Context()` and is canceled on close, so this works for RakNet and NetherNet alike. `cmd/xvrelay/relay_deadconn_test.go` |
+
+After the fixes: **13/13** sessions connected / dialled / spawned, `level=ERROR` **0**,
+`dropped 1 packet` **0**, `non-offer signal` **0**, and `relay write end (destination closed)` 5
+times (clean termination, no WARN). `-reconnect 3` → 4/4 `OK=true`; sequential
+`1001`/`2168`/`2169` → 3/3 `OK=true`. Only two benign WARNs remain: the one-time TOFU private
+key generation and `no host packs available to serve the client`.
+
+**Upstream limitation (measured, not a relay bug):** the real LAN world accepts only **one
+active NetherNet connection at a time**. With 2 concurrent `selfcheck -lan-join` clients, 1
+succeeded and 1 was disconnected after the **host** closed its SCTP transport
+(`->15619059520673756992 ... nethernet: SCTP transport closed`); with 3 concurrent clients
+(1001/2168/2169), 2 were dropped the same way. All **sequential** runs passed. The relay dials
+one host connection per client session by design, so a single client — the intended manual-test
+scenario — is stable. Supporting several concurrent clients would require multiplexing all
+clients over one host connection, which is a larger architectural change.
 
 ### Semantic packet coverage (`PROTO-005`)
 
