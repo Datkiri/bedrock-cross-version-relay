@@ -175,7 +175,7 @@ the spawn-prefix gate are per-session, keyed by connection.
   `2193`/`2169` IDs (1717 are identical), `minecraft:apple` maps `882 → 878` and back `878 → 882`
   (`1001` uses `285`), and `plain New()` leaves `882` untouched. `item_gameplay_test.go` pins a
   **six-packet smoke subset** (including `ItemRegistry`); `semantic_coverage_test.go` measures the
-  real coverage: **10 stack-carrying packet families + the `ItemRegistry` table** are remapped by
+  real coverage: **10 stack-carrying packet families (8 H2C + 2 C2H) + the `ItemRegistry` table** are remapped by
   `1001`/`2168`/`2169`, with `plain New()` and the native `2193` identity codec as pass-through
   controls. An unknown runtime ID is not dropped but replaced by AIR (`hideUnknown=true`).
   Disable with `-map-gameplay-items=false` to reproduce the old behaviour. See
@@ -248,10 +248,12 @@ Honest scope, because "it builds" and "it works" are different claims.
   BDS 1.26.33.1 and resolves every ID against the client's own table; all four protocols reported
   `lost=0 unknown=0 ok=true` (see "Live item census" below). This is the measured replacement for
   the vague "no real client has looked at the inventory" caveat — stacks are decoded, not rendered.
-  **Scope measured by `PROTO-005`:** the census observes **6 packet families**; the relay codec
-  maps **10** stack-carrying families. `AddPlayer.HeldItem`, `MobArmourEquipment`,
-  `InventoryTransaction` and `PlayerAuthInput.ItemInteractionData` are not counted, so those
-  >5,000 stacks are a lower bound, not a complete inventory of the wire.
+  **Scope measured by `PROTO-005` / re-measured 2026-11-05:** `stacksFrom()` extracts all **8
+  host→client** stack-carrying families; the other **2** of the codec's 10 families
+  (`InventoryTransaction`, `PlayerAuthInput.ItemInteractionData`) are **client→host** and cannot be
+  observed from a client at all. The one-player BDS lab emits only 5–6 of the 8 H2C families
+  (`AddPlayer` / `MobArmourEquipment` never occur), so the >5,000 stacks remain a lower bound on
+  the wire's item IDs — see "Live item census".
 - **Invisible-item audit (offline, wire-level):** `cmd/itemaudit` pushes every native `2193` item
   through the real client codec, encodes the packet with that protocol's writer, then decodes it
   with its own packet pool/reader — the same path `Conn.ReadPacket` uses. `NetworkID=0` after the
@@ -325,7 +327,7 @@ Honest scope, because "it builds" and "it works" are different claims.
   downloaded **0** packs. See "Resource-pack prefetch".
 - **Semantic packet coverage (`PROTO-005`, measured 2026-11-05):** `cmd/xvrelay/semantic_coverage_test.go`
   drives the real `resolveProto()` codecs offline with packets built from real registry IDs. Result:
-  **10 stack-carrying families** are remapped by `1001`/`2168`/`2169` in both directions, the
+  **10 stack-carrying families (8 H2C + 2 C2H)** are remapped by `1001`/`2168`/`2169` in both directions, the
   **`ItemRegistry`** table emits `1933`/`1976`/`1976` entries, `plain New()` leaves all 10
   untouched, and the `2193` identity codec keeps the native `882` apple ID. `CraftingData` keeps
   **8 of 11** recipe slices (the two chemistry slices and `MaterialReducers` are dropped);
@@ -358,7 +360,7 @@ index; the detailed numbers and boundaries live in the linked sections above.
 
 | Task | Change | Commit / CI | Key measurement |
 | --- | --- | --- | --- |
-| #19 | Live wire item census + host-1001 `CreativeContent` fix | `f903490` / `41968566411` | BDS 1.26.33.1, 4/4 protocols: `5122/5123/5123/5621` stacks decoded, `lost=0 unknown=0 ok=true` on all four; found and fixed 5 unmapped host-1001 creative IDs |
+| #19 | Live wire item census + host-1001 `CreativeContent` fix | `f903490` / `41968566411` | BDS 1.26.33.1, 4/4 protocols: `5122/5123/5123/5621` stacks at commit time (re-measured after #26: `5118/5121/5120/5620`), `lost=0 unknown=0 ok=true` on all four; found and fixed 5 unmapped host-1001 creative IDs |
 | #20 | Hot-path benchmarks (`RELAY-001`) | `b9738da` / `41970545529` | `ns/op`, `B/op`, `allocs/op` for codec / item / chunk paths; `TestBenchFixtures` makes the fixtures fail CI if they ever stop parsing |
 | #21 | Concurrency / reconnect / soak (`CONN-004`) | `5e445b7` / `42014656107` | 8-session loopback isolation, `-reconnect 3` 4/4, 3 concurrent clients 3/3, 25 s soak, `-race` clean on the offline harness and the live relay |
 | #22 | Resource-pack prefetch + per-dial cost guard (`CONN-005`) | `7ba352d` / `42018501074` | host size lie `594 B declared` vs `734 B real`; prefetch 1 pack in `7.97 s`; budget abort in `35 ms` vs `report` with `overruns=1`; default skip downloads 0 |
@@ -411,14 +413,14 @@ packages (2026-11-05); race coverage is therefore not limited to the three targe
   mapping is asserted offline in `item_gameplay_test.go` (both directions, a six-packet smoke
   subset, no drops, non-native input dropped); `-map-gameplay-items=false` bisects it.
   `cmd/itemaudit` logs **by name** exactly which items become AIR per protocol
-  (143 / 100 / 100 / 0). `cmd/clientclone`
-  goes further: it decodes every item stack in its **six observed packet families** and resolves
+  (143 / 100 / 100 / 0).   `cmd/clientclone`
+  goes further: it decodes every item stack in the **8 host→client packet families** and resolves
   each ID against that client's own table — all four protocols decoded >5,000 named stacks from a
-  live BDS with `lost=0 unknown=0` (see "Live item census" below). Four more item-stack families
-  (`AddPlayer`, `MobArmourEquipment`, `InventoryTransaction`, `PlayerAuthInput`) are remapped by
-  the codec but **not** observed by this census, so the count is a lower bound. The honest
-  boundary remains: this is a codec-level client that decodes stacks, not a game client rendering
-  an inventory UI.
+  live BDS with `lost=0 unknown=0` (see "Live item census" below). The remaining 2 families are
+  **client→host** and cannot be seen by a client-side census; they are measured relay-side by
+  `semantic_coverage_test.go`. In this one-player lab only 5–6 of the 8 H2C families actually
+  occur, so the count is still a lower bound. The honest boundary remains: this is a codec-level
+  client that decodes stacks, not a game client rendering an inventory UI.
 - **Item runtime IDs are int16 on the wire.** `protocol.ItemInstance` writes `NetworkID` with
   `Int16`: an out-of-range probe `900001` decodes as `-17503` even through the identity `2193`
   codec, while in-range unknown IDs (`20000`) survive unchanged. Custom/add-on item IDs outside
@@ -515,7 +517,7 @@ cmd/xvrelay/nethernet_ingress_test.go  CONN-002 full NetherNet/WebRTC ingress lo
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
-cmd/clientclone/items.go    live wire item census: decode stacks, resolve IDs, ITEM_VISIBLE / ITEM_LOST / ITEM_UNKNOWN_ID
+cmd/clientclone/items.go    live wire item census: extract all 8 H2C item-stack families, resolve IDs, ITEM_VISIBLE / ITEM_LOST / ITEM_UNKNOWN_ID
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
 internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address); also the Signaling backend for -listen-nethernet
 internal/lansignal/pong_test.go  MCPE-pong -> binary ServerData conversion + CONNECTREQUEST/RESPONSE signalling round trip
@@ -827,9 +829,12 @@ Other measured boundaries:
 | `LevelEvent` destroy/crack block, `LevelSoundEvent`, `AddActor` falling-block variant, `UpdateBlock*` | **block** runtime IDs are mapped (source-verified in `gameplay_transactions.go` / `gameplay_mapping.go`); these belong to the block translation path, not the item census. |
 | `BiomeDefinitionList`, `SetActorData`, `SpawnParticleEffect`, `BlockActorData` (NBT), `AvailableActorIdentifiers` | forwarded as **1 packet unchanged**, **0** item runtime IDs. `MapBiomeRuntimeID` is defined on every adapter but is **not part of** the vendored `minecraft.Protocol` interface and has **no call site** in this repo or the pinned `go-multiversion` module — it is a Dragonfly chunk-cache hook, not a relay path. |
 
-Honest boundaries: (1) `cmd/clientclone`'s live wire census observes only **6** of those 10
-families — `AddPlayer.HeldItem`, `MobArmourEquipment`, `InventoryTransaction` and
-`PlayerAuthInput.ItemInteractionData` are not counted, so its >5,000 stacks are a lower bound.
+Honest boundaries: (1) `cmd/clientclone`'s live wire census now extracts all **8 H2C** families,
+but the 2 **C2H** families (`InventoryTransaction`, `PlayerAuthInput.ItemInteractionData`) cannot
+reach a client at all — they need a relay/server-side hook. Measured on the one-player BDS lab,
+only 5–6 of the 8 H2C families actually occur (`AddPlayer`, `MobArmourEquipment` never appear),
+so its >5,000 stacks remain a lower bound. Coverage of all 10 families is therefore pinned
+**offline** by `semantic_coverage_test.go`, not claimed from the live census.
 (2) A "forwarded unchanged" packet is not a claim that its *semantics* are version-compatible:
 biome definitions, entity metadata, NBT and particle expressions may still mean different things
 across versions, and add-on-defined content is out of scope. (3) These are offline codec
@@ -912,13 +917,16 @@ decoding through `codec.Packets(false)` leaves 0.
 ### Live item census (headless client)
 
 `cmd/clientclone/items.go` answers the question the offline audit cannot: which item stacks did a
-real client **actually decode from the live wire**. Every post-spawn `InventoryContent`,
-`InventorySlot`, `MobEquipment`, `AddItemActor`, `CreativeContent` and `CraftingData` stack has its
-`NetworkID` resolved against `blocktranslate.Items(clientProto)` — the client's own table, not the
-native 2193 one. Each stack is logged as `ITEM_VISIBLE` (named item), `ITEM_LOST` (a
+real client **actually decode from the live wire**. `stacksFrom()` extracts stacks from **all eight
+host→client (H2C) families**: `InventoryContent`, `InventorySlot`, `MobEquipment`, `AddPlayer.HeldItem`,
+`MobArmourEquipment` (5 slots), `AddItemActor`, `CreativeContent` and `CraftingData`. Each
+`NetworkID` is resolved against `blocktranslate.Items(clientProto)` — the client's own table, not
+the native 2193 one. Each stack is logged as `ITEM_VISIBLE` (named item), `ITEM_LOST` (a
 creative/recipe entry that arrived as AIR, id 0) or `ITEM_UNKNOWN_ID` (non-zero ID absent from the
 table); `items_decoded/visible/lost/unknown/empty_slots`, `items_by_packet` and visible-name samples
-go into the JSON report and four new assertions.
+go into the JSON report and four new assertions. `AddPlayer` and `MobArmourEquipment` are **not**
+consumed by gophertunnel's internal `handlePacket()` switch, so they still reach `ReadPacket()`
+even though they arrive near the spawn burst.
 
 ```bash
 ./dist/clientclone -auto -addr 127.0.0.1:19164 -proto 2193 \
@@ -931,10 +939,17 @@ Measured against BDS 1.26.33.1 (`transport=raknet`, relay `-host-raknet 127.0.0.
 
 | Client proto | stacks decoded | visible | lost | unknown | `ok` |
 | --- | --- | --- | --- | --- | --- |
-| `1001` | 5122 | 5021 | 0 | 0 | true |
-| `2168` | 5123 | 5022 | 0 | 0 | true |
-| `2169` | 5123 | 5022 | 0 | 0 | true |
-| `2193` | 5621 | 5520 | 0 | 0 | true |
+| `1001` | 5118 | 5017 | 0 | 0 | true |
+| `2168` | 5121 | 5020 | 0 | 0 | true |
+| `2169` | 5120 | 5019 | 0 | 0 | true |
+| `2193` | 5620 | 5519 | 0 | 0 | true |
+
+Re-measured 2026-11-05 19:46–19:50 after extending `stacksFrom()` from six to all eight H2C
+families (the earlier table at commit `f903490` read `5122/5123/5123/5621`). The small deltas are
+session-to-session variation, not new items: `items_by_packet` in this one-player BDS lab contains
+only `CreativeContent`, `CraftingData`, `InventoryContent`, `InventorySlot`, `MobEquipment` and
+(2193 only) `AddItemActor`. **`AddPlayer` and `MobArmourEquipment` never occur in this world**, so
+the wider extractor does not inflate the count — this is measured, not assumed.
 
 **Bug this census found and fixed.** The first `2193` run exposed 5 `CreativeContent` stacks with
 IDs `257 / 427 / 716 / 717 / 719` — `copper_spear`, `black_dye` and three pottery sherds. Those
@@ -952,9 +967,14 @@ Relay log: `host1001 creative items mapped to native IDs items=1875 mapped=1962 
 unknown=0`. `host_creative1001_test.go` pins the five IDs and the addon-drop case.
 
 Boundary: this is a headless codec-level client decoding item **stacks**; it still does not render
-an inventory UI. It observes **6 of the 10** stack-carrying families the codec remaps — see
-[Semantic packet coverage](#semantic-packet-coverage-proto-005) — so `items_decoded` is a lower
-bound, not a complete census of item IDs on the wire.
+an inventory UI. The codec remaps **10** stack-carrying families, but only **8 are H2C** —
+`stacksFrom()` now handles all 8 of them. The other two (`InventoryTransaction`,
+`PlayerAuthInput.ItemInteractionData`) are **client→host** and can never arrive on a client's
+`ReadPacket()`; observing them requires a relay/server-side hook, not `clientclone`. So
+`items_decoded` is still a lower bound on the wire's item IDs — now because the world/script only
+emits a subset of the H2C families (2 of the 8 never occur in this lab) and because C2H traffic is
+out of scope for a client, **not** because the extractor is missing cases. See
+[Semantic packet coverage](#semantic-packet-coverage-proto-005).
 
 Measured baseline (2026-11-05, CGO disabled): `go build -buildvcs=false ./...`,
 `go vet ./...`, `go test -buildvcs=false ./...` all pass, including `cmd/selfcheck`,

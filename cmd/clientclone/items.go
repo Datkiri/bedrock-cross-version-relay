@@ -7,12 +7,20 @@ package main
 // or zeroed runtime ID is visible as a named log line instead of a vague
 // caveat. It is still a codec-level client: it does not render an inventory.
 //
-// SCOPE (PROTO-005): stacksFrom() observes SIX packet families, not every
-// item-carrying packet. The relay codec remaps TEN stack-carrying families
-// (see cmd/xvrelay/semantic_coverage_test.go); this census omits
-// AddPlayer.HeldItem, MobArmourEquipment, InventoryTransaction and
-// PlayerAuthInput.ItemInteractionData. The live census numbers are therefore
-// a lower bound on decoded stacks, not a complete item inventory of the wire.
+// SCOPE (PROTO-005, measured 2026-11-05): the relay codec remaps TEN
+// stack-carrying families, but only EIGHT of them are host->client (H2C).
+// stacksFrom() now observes all EIGHT H2C families. The other two
+// (InventoryTransaction, PlayerAuthInput.ItemInteractionData) are client->
+// host (C2H): a client-side ReadPacket() can never receive them, so observing
+// those needs a relay/server-side hook, not clientclone. See the direction
+// table in cmd/xvrelay/semantic_coverage_test.go.
+//
+// AddPlayer and MobArmourEquipment were previously assumed to arrive "before
+// the item index is ready". That was wrong: gophertunnel's handlePacket()
+// consumes only 13 internal packet types (StartGame, ItemRegistry, PlayStatus,
+// ResourcePacks*, ...), and neither is among them. They queue up and are read
+// after itemsReady is set, so they are observable like any other post-spawn
+// packet.
 
 import (
 	"fmt"
@@ -88,6 +96,13 @@ func stacksFrom(pk packet.Packet) (stacks []protocol.ItemStack, creative bool) {
 		}
 	case *packet.MobEquipment:
 		stacks = append(stacks, p.NewItem.Stack)
+	case *packet.AddPlayer:
+		stacks = append(stacks, p.HeldItem.Stack)
+	case *packet.MobArmourEquipment:
+		// Five slots. An id of 0 here is a legitimately empty armour slot,
+		// not a lost item, so creative stays false.
+		stacks = append(stacks, p.Helmet.Stack, p.Chestplate.Stack,
+			p.Leggings.Stack, p.Boots.Stack, p.Body.Stack)
 	case *packet.AddItemActor:
 		stacks = append(stacks, p.Item.Stack)
 	case *packet.CreativeContent:

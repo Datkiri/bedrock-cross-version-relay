@@ -43,16 +43,13 @@ func TestItemIndexUsesClientProtocolTable(t *testing.T) {
 	}
 }
 
-// TestStacksFromCoversObservedItemFamilies pins the SIX families the live
-// census actually observes. It deliberately does NOT mean "every item packet":
-// AddPlayer.HeldItem, MobArmourEquipment (5 slots), InventoryTransaction
-// (actions + held item) and PlayerAuthInput.ItemInteractionData also carry
-// item runtime IDs and are remapped by the relay codec, but this headless
-// census does not observe them (PlayerAuthInput/InventoryTransaction are
-// mostly serverbound; the other two arrive with the spawn burst, before the
-// item index is ready). See cmd/xvrelay/semantic_coverage_test.go for the
-// measured ten-family codec coverage and README "Semantic packet coverage".
-func TestStacksFromCoversObservedItemFamilies(t *testing.T) {
+// TestStacksFromCoversAllHostToClientItemFamilies pins the EIGHT host->client
+// (H2C) families a client-side census can actually observe. The relay codec
+// remaps TEN stack-carrying families, but the other two are client->host and
+// are covered by TestStacksFromDoesNotClaimServerboundFamilies below. See the
+// direction table in cmd/xvrelay/semantic_coverage_test.go and README
+// "Semantic packet coverage".
+func TestStacksFromCoversAllHostToClientItemFamilies(t *testing.T) {
 	cases := []struct {
 		name     string
 		pk       packet.Packet
@@ -68,6 +65,11 @@ func TestStacksFromCoversObservedItemFamilies(t *testing.T) {
 			StorageItem: protocol.Option(stack(5, 1)),
 		}, 2, false},
 		{"MobEquipment", &packet.MobEquipment{NewItem: stack(6, 1)}, 1, false},
+		{"AddPlayer", &packet.AddPlayer{HeldItem: stack(12, 1)}, 1, false},
+		{"MobArmourEquipment", &packet.MobArmourEquipment{
+			Helmet: stack(13, 1), Chestplate: stack(14, 1), Leggings: stack(15, 1),
+			Boots: stack(16, 1), Body: stack(17, 1),
+		}, 5, false},
 		{"AddItemActor", &packet.AddItemActor{Item: stack(7, 1)}, 1, false},
 		{"CreativeContent", &packet.CreativeContent{
 			Items: []protocol.CreativeItem{{Item: stack(8, 1).Stack}, {Item: stack(9, 1).Stack}},
@@ -76,6 +78,9 @@ func TestStacksFromCoversObservedItemFamilies(t *testing.T) {
 			ShapedRecipes:    []protocol.ShapedRecipe{{Output: []protocol.ItemStack{stack(10, 1).Stack}}},
 			ShapelessRecipes: []protocol.ShapelessRecipe{{Output: []protocol.ItemStack{stack(11, 1).Stack}}},
 		}, 2, true},
+	}
+	if len(cases) != 8 {
+		t.Fatalf("expected 8 H2C families, got %d (the direction table changed?)", len(cases))
 	}
 	for _, c := range cases {
 		stacks, creative := stacksFrom(c.pk)
@@ -93,6 +98,32 @@ func TestStacksFromCoversObservedItemFamilies(t *testing.T) {
 	}
 	if stacks, _ := stacksFrom(&packet.LevelChunk{}); len(stacks) != 0 {
 		t.Fatal("a packet without item stacks must not observe anything")
+	}
+}
+
+// TestStacksFromDoesNotClaimServerboundFamilies pins the architectural
+// boundary: InventoryTransaction and PlayerAuthInput.ItemInteractionData DO
+// carry item runtime IDs and ARE remapped by the relay codec, but they travel
+// client->host. A client-side ReadPacket() can never see them, so the census
+// must not claim them. They are measured relay-side by
+// cmd/xvrelay/semantic_coverage_test.go instead.
+func TestStacksFromDoesNotClaimServerboundFamilies(t *testing.T) {
+	cases := []packet.Packet{
+		&packet.InventoryTransaction{
+			Actions:         []protocol.InventoryAction{{OldItem: stack(1, 1), NewItem: stack(2, 1)}},
+			TransactionData: &protocol.NormalTransactionData{},
+		},
+		&packet.PlayerAuthInput{
+			ItemInteractionData: protocol.Option(protocol.UseItemTransactionData{
+				HeldItem:   stack(3, 1),
+				ActionType: protocol.UseItemActionClickAir,
+			}),
+		},
+	}
+	for _, pk := range cases {
+		if stacks, _ := stacksFrom(pk); len(stacks) != 0 {
+			t.Errorf("%T is C2H; a client census must not observe %d stacks", pk, len(stacks))
+		}
 	}
 }
 
