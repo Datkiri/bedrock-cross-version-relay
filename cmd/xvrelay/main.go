@@ -144,6 +144,9 @@ var (
 	// A 1.26.51 client needs the map's pack (textures/models/sounds); without it a map that
 	// ships a pack renders wrong or gets disconnected.
 	hostPacks atomic.Pointer[[]*resource.Pack]
+	// packCfg is the CONN-005 policy, set once from flags. Default is skip + no prefetch,
+	// i.e. exactly the behaviour before this guard existed.
+	packCfg = defaultPackPolicy()
 
 	// dropIDs: set of packet IDs dropped on the way to the client — bisect one packet type
 	// at a time.
@@ -230,6 +233,9 @@ type spawnCapture struct {
 	voxelSent       atomic.Bool
 	chunkLogged     atomic.Bool
 	publisherLogged atomic.Bool
+	// packs is the PER-DIAL resource-pack guard (CONN-005). It is an atomic pointer
+	// because dialHostWith installs it while the handshake is already running.
+	packs atomic.Pointer[packGuard]
 }
 
 // reset wipes the data from the previous dial (used when auto-probing another protocol).
@@ -243,6 +249,7 @@ func (c *spawnCapture) reset() {
 	c.voxelSent.Store(false)
 	c.chunkLogged.Store(false)
 	c.publisherLogged.Store(false)
+	c.packs.Store(nil)
 }
 
 // session is the per-client state of one relayed connection.
@@ -2021,37 +2028,39 @@ func dialHostWith(ctx context.Context, ls *lansignal.Signaling, id uint64, cd lo
 	if protoID == 1001 {
 		proto = host1001Protocol{Protocol: proto}
 	}
+
+	// CONN-005: ONE guard per dial (sessions can spawn concurrently). packCtx is the
+	// parent of the dial context, so the guard can abort the DialContext wait on spawn
+	// the moment a REAL pack size breaks a limit — instead of burning dialTimeout on a
+	// host that misreports sizes. See cmd/xvrelay/packs.go for the measured seams.
+	packCtx, packCancel := context.WithCancel(ctx)
+	defer packCancel()
+	g := newPackGuard(packCfg)
+	g.setAbort(func(reason string) {
+		slog.Warn("xvrelay: pack guard cancelled the host dial", "reason", reason)
+		packCancel()
+	})
+	cap.packs.Store(g)
+	hostCodec := packSniffProtocol{Protocol: proto, guard: g}
+
 	d := minecraft.Dialer{
 		EnableClientCache:   false, // rewritten chunk bytes must not retain host blob hashes
 		KeepXBLIdentityData: true,  // keep XUID/TitleID in the token sent to the host
 		IdentityData:        identity,
 		ClientData:          cd,
-		Protocol:            proto,
+		Protocol:            hostCodec,
 		ErrorLog:            slog.Default().With("link", "host"),
 		PacketFunc:          newHostPacketFunc(cap),
 		// Cache packs across dials: a host with its own pack would otherwise re-download from
 		// scratch every session and blow the timeout (log 21:35: ResourcePackDataInfo ×3 then
 		// deadline).
 		ResourcePackCache: minecraft.DirResourcePackCache{Dir: packCacheDir()},
-		// ★ REFUSE TO DOWNLOAD PACKS. Evidence: the host has a language pack versioned
-		// "1.6.8-c708ce7"; gophertunnel downloads it, then resource.Read fails ("invalid version
-		// component 8-c708ce7") and conn.go:1285 returns EARLY WITHOUT decrementing packAmount ⇒
-		// expect(IDResourcePackStack) never completes ⇒ the dial hangs until the timeout
-		// (log 21:57:36: elapsed exactly 1m30s, no StartGame).
-		// Returning false ⇒ the pack goes into ignoredResourcePacks, packAmount drops, the dial
-		// proceeds. A 1.26.51 client could not use a 1.26.33 pack anyway, so dropping it is right.
-		// ★ DO NOT download packs inside the dial.
-		// The host misreports the pack size (`pack had a different size ...`), so gophertunnel
-		// waits for `pack.size` bytes ⇒ hangs until dialTimeout (log 22:27:54: exactly 1m30s;
-		// another run hung >100 s and RAM ballooned by 400 MB). Packs are not needed to join:
-		// the client still enters the world, it only lacks the map's own textures/models.
-		// Serving packs would require a successful prefetch saved to disk first (not possible yet
-		// because the cache key is size-based and also mismatched).
-		DownloadResourcePack: func(id uuid.UUID, version string, current, total int) bool {
-			slog.Warn("xvrelay: skipping the host's resource pack (host misreports the size; downloading would hang)",
-				"uuid", id.String(), "version", version, "pack", fmt.Sprintf("%d/%d", current+1, total))
-			return false
-		},
+		// ★ Default policy (pack-mode=skip) still refuses every pack — the behaviour that
+		// was hardcoded here before CONN-005. The guard only downloads when the operator
+		// explicitly asks for -pack-mode download|limit, and it bounds the cost by
+		// -pack-budget-mb / -pack-max-mb. A lying host is caught at ResourcePackDataInfo
+		// (the REAL size) before the first chunk is requested (-pack-overrun abort).
+		DownloadResourcePack: g.decide,
 	}
 	// Send the HOST's version to the host, not the client's version.
 	// (the caller may have forced one, e.g. -probe-version)
@@ -2082,22 +2091,33 @@ func dialHostWith(ctx context.Context, ls *lansignal.Signaling, id uint64, cd lo
 		"identity", identity.Identity, "selfSignedId", d.ClientData.SelfSignedID,
 		"thirdPartyName", d.ClientData.ThirdPartyName,
 		"hostProto", protoID, "gameVersion", d.ClientData.GameVersion)
-	dctx, cancel := context.WithTimeout(ctx, timeout)
+	dctx, cancel := context.WithTimeout(packCtx, timeout)
 	defer cancel()
+	var conn *minecraft.Conn
+	var dialErr error
 	if directHostAddr != "" {
 		// Plain RakNet host (BDS with transport=raknet). No WebRTC offer/answer,
 		// no LAN discovery signalling — the self-check harness uses this path.
 		slog.Info("xvrelay: dialling host over direct RakNet",
 			"addr", directHostAddr, "hostProto", protoID)
-		return d.DialContext(dctx, "raknet", directHostAddr)
+		conn, dialErr = d.DialContext(dctx, "raknet", directHostAddr)
+	} else {
+		conn, dialErr = d.DialContextNetwork(dctx, minecraft.NetherNet{
+			Signaling: ls,
+			Dialer: nethernet.Dialer{
+				AllowIdentitylessServer: true,
+				DisableTrickleICE:       true,
+			},
+		}, strconv.FormatUint(id, 10))
 	}
-	return d.DialContextNetwork(dctx, minecraft.NetherNet{
-		Signaling: ls,
-		Dialer: nethernet.Dialer{
-			AllowIdentitylessServer: true,
-			DisableTrickleICE:       true,
-		},
-	}, strconv.FormatUint(id, 10))
+	if dialErr != nil {
+		if aborted, reason := g.abortStatus(); aborted {
+			return nil, fmt.Errorf("%w (pack guard aborted the host dial: %s)", dialErr, reason)
+		}
+		return nil, dialErr
+	}
+	slog.Info("xvrelay: pack guard summary", "hostProto", protoID, "summary", g.summary())
+	return conn, nil
 }
 
 // uuidForXUID reproduces Java's UUID.nameUUIDFromBytes exactly:
@@ -2362,7 +2382,14 @@ func prefetchHostPacks(ctx context.Context, ls *lansignal.Signaling, id uint64) 
 		CurrentInputMode: 1,
 	}
 	start := time.Now()
-	conn, err := dialHost(ctx, ls, id, cd, identity, &spawnCapture{})
+	cap := &spawnCapture{}
+	conn, err := dialHost(ctx, ls, id, cd, identity, cap)
+	if g := cap.packs.Load(); g != nil {
+		slog.Info("xvrelay: pack prefetch guard", "summary", g.summary())
+		if aborted, reason := g.abortStatus(); aborted {
+			slog.Warn("xvrelay: pack prefetch aborted by the guard", "reason", reason)
+		}
+	}
 	if err != nil {
 		slog.Warn("xvrelay: pack prefetch failed", "error", err, "elapsed", time.Since(start))
 		return
@@ -2657,6 +2684,16 @@ func main() {
 	dumpStart := flag.String("dumpstartgame", "", "write the StartGame payload SENT TO THE CLIENT to a file (diagnostic)")
 	decodeFile := flag.String("decodefile", "", "decode a StartGame payload from a file, print its fields, exit")
 	versionFlag := flag.Bool("version", false, "print the build version and exit")
+	packModeFlag := flag.String("pack-mode", "skip",
+		"CONN-005 resource-pack policy: skip (default, never download) | download | limit (declared size <= -pack-max-mb)")
+	packMaxMBFlag := flag.Float64("pack-max-mb", 8,
+		"with -pack-mode limit: per-pack DECLARED size ceiling in MB (0 = no per-pack ceiling)")
+	packBudgetMBFlag := flag.Float64("pack-budget-mb", 32,
+		"hard ceiling on total resource-pack bytes accounted per dial in MB (0 = unlimited)")
+	packOverrunFlag := flag.String("pack-overrun", "abort",
+		"when the REAL size from ResourcePackDataInfo breaks a limit: abort (cancel dial) | report (log only)")
+	packPrefetchFlag := flag.Bool("pack-prefetch", false,
+		"dial the host once BEFORE opening the listener so the first client also receives the map's packs (needs -pack-mode download|limit)")
 	flag.Parse()
 	directHostAddr = *directHost
 
@@ -2677,6 +2714,37 @@ func main() {
 		blocktranslate.DumpSubchunkPath = *dumpSub
 	}
 	dialTimeout = *dialTimeoutFlag
+	// CONN-005: invalid pack flags always fall back to the SAFE policy (skip), never
+	// to a download. A typo must not turn a relay into an unbounded pack downloader.
+	{
+		mode, err := parsePackMode(*packModeFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "xvrelay:", err, "— falling back to skip")
+			mode = packModeSkip
+		}
+		overrun, err := parsePackOverrun(*packOverrunFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "xvrelay:", err, "— falling back to abort")
+			overrun = packOverrunAbort
+		}
+		maxMB, budgetMB := *packMaxMBFlag, *packBudgetMBFlag
+		if maxMB < 0 || budgetMB < 0 {
+			fmt.Fprintln(os.Stderr, "xvrelay: -pack-max-mb / -pack-budget-mb must be >= 0 — clamping to 0")
+			if maxMB < 0 {
+				maxMB = 0
+			}
+			if budgetMB < 0 {
+				budgetMB = 0
+			}
+		}
+		packCfg = packPolicy{Mode: mode, MaxMB: maxMB, BudgetMB: budgetMB,
+			Overrun: overrun, Prefetch: *packPrefetchFlag}
+		if *packPrefetchFlag && !prefetchEnabled(packCfg) {
+			fmt.Fprintln(os.Stderr, "xvrelay: -pack-prefetch needs -pack-mode download|limit — prefetch stays off")
+		}
+		slog.Info("xvrelay: resource-pack policy", "mode", mode, "maxMB", maxMB,
+			"budgetMB", budgetMB, "overrun", overrun, "prefetch", prefetchEnabled(packCfg))
+	}
 	if *dumpWireIDsFlag != "" {
 		dumpWireIDs = make(map[uint32]bool)
 		for _, part := range strings.Split(*dumpWireIDsFlag, ",") {
@@ -2960,9 +3028,10 @@ func main() {
 	// client is logging in, and at that moment the dial has not happened yet ⇒ the first client
 	// would get no packs. One extra dial here (packs are cached in log/pack-cache) buys every
 	// client the map's correct packs.
-	// Prefetch is currently OFF: the host misreports sizes ⇒ the download hangs, and packs are not
-	// needed to join. Turn it back on once packs can be stored to disk reliably.
-	if false {
+	// CONN-005: the old hardcoded `if false` is gone. Prefetch is now opt-in behind
+	// -pack-prefetch AND requires a download policy; the per-dial pack guard bounds the
+	// cost (declared size, REAL size, budget, overrun abort). Default = off = old behaviour.
+	if prefetchEnabled(packCfg) {
 		prefetchHostPacks(ctx, ls, w.NetworkID)
 	}
 	listener, err := listenCfg.Listen("raknet", *listenAddr)

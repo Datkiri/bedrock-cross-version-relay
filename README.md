@@ -199,6 +199,11 @@ codec.
 | `-verify` | off | encode→decode every client-bound packet and drop the broken ones (slower, diagnostic) |
 | `-audit` | off | re-parse client-bound chunks and check state IDs against the target registry |
 | `-probe` | off | dial the world once and exit, no client needed |
+| `-pack-mode` | `skip` | `skip` / `download` / `limit` resource-pack policy (`CONN-005`) |
+| `-pack-max-mb` | `8` | per-pack declared-size ceiling in `limit` mode, `0` = none |
+| `-pack-budget-mb` | `32` | total accounted pack bytes per dial, `0` = unlimited |
+| `-pack-overrun` | `abort` | `abort` cancels the dial when the REAL size breaks a ceiling; `report` only logs |
+| `-pack-prefetch` | off | extra host dial before the listener; needs `-pack-mode download\|limit` |
 
 There are also a number of `-strip*` / `-no*` bisect flags (`-stripregs`, `-stripitems`,
 `-stripactors`, `-nochunks`, `-nosubchunk`, `-onlyprefix`, `-nopush`, `-dropids`, …). They exist to
@@ -288,11 +293,24 @@ Honest scope, because "it builds" and "it works" are different claims.
   three clients spawned ~9 s apart (17:41:59 / 17:42:08 / 17:42:17) — throughput is serialised,
   not racy; (2) `heap_alloc` still grows ~0.04 MB/s in steady state with GC count flat, so a
   small retained-heap trend is **not** ruled out without an hours-long soak.
+- **Resource-pack prefetch / cost guard (`CONN-005`, measured 2026-11-05):** `cmd/xvrelay/packs.go`
+  wraps the host `minecraft.Protocol` and observes `ResourcePacksInfo` / `ResourcePackDataInfo`
+  in `ConvertToLatest` — i.e. **after decode, before** `handlePacket` — so the `DownloadResourcePack`
+  callback can decide from real sizes instead of guessing. Ten unit tests (`packs_test.go`) pin the
+  policy, budget, lie detection, overrun abort and skipped-pack isolation. Live on BDS 1.26.33.1
+  with a minimal `.mcpack` (pack `9f1b0c2e-…`): the host advertised **594 B** but
+  `ResourcePackDataInfo` reported **734 B** (`size_lies=1`), the guard reconciled the accounted cost
+  to **734 B**, and `-pack-prefetch` stored **1 pack** in `7.97 s`; the relay then logged
+  `serving the host's packs to the client count=1` and `selfcheck` spawned with `OK=true`
+  (1161 packets, 921 chunks, `registry=true`). With `-pack-budget-mb 0.0006` (629 B, between the
+  declared and real sizes), `-pack-overrun abort` cancelled the dial in **35 ms** with exit 1, while
+  `-pack-overrun report` let the same dial succeed (`overruns=1`). Default `-pack-mode skip`
+  downloaded **0** packs. See "Resource-pack prefetch".
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
-- **Not verified:** real Minecraft sessions for every pair, add-ons, resource packs, biomes, entity
-  metadata, particles, long play sessions, and anything the matrix does not name. The tests prove the
-  invariants they check; they do not promise full gameplay compatibility.
+- **Not verified:** real Minecraft sessions for every pair, add-ons, required/encrypted resource
+  packs, biomes, entity metadata, particles, long play sessions, and anything the matrix does not
+  name. The tests prove the invariants they check; they do not promise full gameplay compatibility.
 
 ## Limitations
 
@@ -349,9 +367,13 @@ Honest scope, because "it builds" and "it works" are different claims.
   `-host-raknet` replaces that host leg with a plain RakNet dial for a BDS configured with
   `transport=raknet`. A client that can only speak NetherNet — for example one joining through an
   activity handle instead of the LAN list — cannot connect. This is a design boundary, not a bug.
-- **Resource-pack prefetch is disabled** (`if false` before `prefetchHostPacks`): hosts were observed
-  misreporting pack sizes, which made the download hang. Packs are still served to the client from the
-  most recent host dial; only the pre-dial is off.
+- **Resource-pack prefetch is opt-in, not disabled.** The old hardcoded `if false` before
+  `prefetchHostPacks` is gone. `-pack-prefetch` plus `-pack-mode download|limit` runs one extra host
+  dial before the listener so even the first client gets the map's packs. Default is
+  `-pack-mode skip` with prefetch off — byte-for-byte the previous behaviour. A per-dial guard
+  bounds the cost and aborts on a lying host; see "Resource-pack prefetch". Hosts were observed
+  misreporting pack sizes (594 B declared / 734 B real on this lab's minimal pack), which is
+  exactly what the guard detects.
 - **Custom block states** are only handled when they carry explicit typed state properties with
   hashing enabled; runtime-ID ordering of a custom palette is rejected rather than guessed.
 - **Protocol IDs are not a promise.** Two builds can share `2193` and still differ in registry
@@ -369,8 +391,14 @@ Honest scope, because "it builds" and "it works" are different claims.
     **measured** (see "Concurrency / lifecycle"). Still **not** run: a multi-client, hours-long
     soak; `heap_alloc` grows ~0.04 MB/s in steady state with `num_gc` flat, so a small
     retained-heap trend cannot be excluded. Host dials are also serialised by `hostProtoMu`.
-  - `CONN-005` — pack prefetch stays off; the self-check observed `ResourcePackStack/DataInfo/
-    ChunkData = 0/0/0` on a pack-free BDS, so the pack edge cases are untested.
+  - `CONN-005` — the host-side prefetch and cost guard are **measured** (see "Resource-pack
+    prefetch"): one minimal `.mcpack`, real-vs-declared size, budget abort and report, and a
+    client that spawned with packs served. Still **not** tested: required / encrypted / addon
+    packs, multi-pack stacks, and a real game client rendering the pack's textures. Note that
+    `selfcheck`'s `ResourcePackStack/DataInfo/ChunkData` counters read **0/0/0 even with a pack** —
+    login-phase pack packets are consumed internally by gophertunnel (`conn.spawn`), so those
+    counters cannot observe the client-side pack download at all. That 0/0/0 is a measurement
+    blind spot, not evidence that no pack was served.
   - `PROTO-005` — **item runtime IDs** inside crafting / creative / inventory packets ARE mapped and
     live-verified (see "Live item census"), but biome schemas, entity metadata, block-entity NBT,
     particles and arbitrary add-on payload semantics are not re-mapped; those families are only
@@ -394,6 +422,8 @@ cmd/xvrelay/host_creative1001_test.go  pins host-1001 creative IDs -> native 219
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
 cmd/xvrelay/bench_test.go        hot-path benchmarks (codec / item / chunk) + fixture validity test
 cmd/xvrelay/concurrency_test.go  8-session loopback concurrency / isolation / leak / race harness
+cmd/xvrelay/packs.go        CONN-005 pack policy + per-dial guard + host-Protocol sniff wrapper
+cmd/xvrelay/packs_test.go   policy / budget / real-size lie / overrun abort / skipped-pack tests
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
@@ -518,6 +548,65 @@ Honest boundary: these are **microbenchmarks on synthetic-but-parseable payloads
 CPU profiling and not end-to-end latency percentiles. `RELAY-001` now has per-operation numbers
 instead of "not measured", but the process-level claim remains deliberately out of scope (it is not
 portable across platforms) and a soak test is still needed for tail latency.
+
+### Resource-pack prefetch (`CONN-005`)
+
+The old hardcoded `if false` before `prefetchHostPacks` is gone. Prefetch is now **opt-in** and
+guarded, because a host that misreports pack sizes can otherwise hang the dial: `resource.Read()`
+failing on a weird manifest version returns early without decrementing `packAmount`, so
+`expect(IDResourcePackStack)` never completes and `DialContext` waits out `-dial-timeout`.
+
+```bash
+# default: no packs downloaded, no prefetch (previous behaviour)
+./dist/xvrelay -host-raknet 127.0.0.1:19132 -host-proto 1001 -listen 127.0.0.1:19164
+
+# bounded prefetch: first client also gets the map's pack
+./dist/xvrelay -host-raknet 127.0.0.1:19132 -host-proto 1001 \
+  -listen 127.0.0.1:19164 -pack-mode limit -pack-max-mb 8 \
+  -pack-budget-mb 32 -pack-overrun abort -pack-prefetch
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-pack-mode` | `skip` | `skip` = refuse every pack; `download` = take all; `limit` = only packs whose **declared** size ≤ `-pack-max-mb` |
+| `-pack-max-mb` | `8` | per-pack declared-size ceiling in `limit` mode (`0` = no ceiling) |
+| `-pack-budget-mb` | `32` | hard ceiling on total accounted pack bytes **per dial** (`0` = unlimited) |
+| `-pack-overrun` | `abort` | `abort` = cancel the host dial; `report` = log and keep downloading |
+| `-pack-prefetch` | `false` | one extra host dial before the listener (no-op unless mode is `download`/`limit`) |
+
+How the guard works, with the measured seams in the vendored `2193` fork:
+
+1. `packet.go:74` calls `conn.proto.ConvertToLatest(pk, conn)` for every decoded packet,
+   **before** `handlePacket()`. `packSniffProtocol` wraps the host codec there, so it sees
+   `ResourcePacksInfo` / `ResourcePackDataInfo` already decoded and cross-version converted.
+2. `DownloadResourcePack` has no size argument; the advert table populated in step 1 is what
+   lets `decide()` apply `-pack-max-mb` and `-pack-budget-mb` from **declared** sizes.
+3. `ResourcePackDataInfo` arrives before the first `ResourcePackChunkRequest` is even sent
+   (`conn.go:1313` starts that goroutine after `handleResourcePackDataInfo` returns). It carries
+   the **real** compressed size. The guard reconciles the accounted cost, logs a lie, and — if a
+   ceiling is now broken — cancels the dial context. `DialContext`'s select has
+   `case <-ctx.Done()`, so the wait on spawn ends immediately instead of hanging.
+4. DataInfo for a pack that was **not** approved is ignored; those packs consume no bytes.
+
+Live BDS 1.26.33.1 measurement (2026-11-05, `transport=raknet`, one minimal `.mcpack` with UUID
+`9f1b0c2e-…`, 674-byte archive):
+
+| Case | Result |
+| --- | --- |
+| `-pack-mode limit -pack-prefetch` | `advertised=1 (594 B) downloaded=1 skipped=0 size_lies=1 real=734 B accounted=734 B`; prefetch stored **1 pack** in **7.97 s**; relay logged `serving the host's packs to the client count=1`; `selfcheck` `OK=true` (1161 packets, 921 chunks, `registry=true`) |
+| `-pack-budget-mb 0.0006 -pack-overrun abort` (629 B, between 594 and 734) | `real accounted total 734 B > -pack-budget-mb 629 B` → dial cancelled in **35 ms**, exit **1**, no hang |
+| same budget, `-pack-overrun report` | `overruns=1 policy=report size_lies=1`, `PROBE SUCCEEDED`, exit **0** |
+| default `-pack-mode skip` | `downloaded=0 skipped=1 accounted=0 B`, `PROBE SUCCEEDED`, exit **0** |
+
+Honest boundaries: (1) `selfcheck`'s `ResourcePackStack/DataInfo/ChunkData` counters stay
+**0/0/0 even with a pack**, because login-phase pack packets are consumed internally by
+gophertunnel's `conn.spawn` and never surface on `ReadPacket()` — they cannot prove or disprove
+the client-side download. The client-side evidence here is the relay's `FetchResourcePacks` log
+plus a successful spawn, not a rendered texture. (2) Only one small, unencrypted, non-required
+pack was tested; required/encrypted/addon packs, multi-pack stacks and cache-only packs are not.
+(3) `-pack-overrun abort` cancels the dial context; gophertunnel's `DialContext` does not close
+the underlying connection on that path, so a host-side goroutine may linger until the transport
+disconnects — the same behaviour as the pre-existing `-dial-timeout` path.
 
 ### Terminal client clone (headless, command-driven)
 
