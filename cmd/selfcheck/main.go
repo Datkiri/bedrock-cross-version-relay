@@ -71,6 +71,11 @@ type config struct {
 	lanAddr    string
 	networkID  string
 	lanTimeout time.Duration
+
+	// interactions sends the C2H packet families a real GUI client uses to
+	// place/click blocks and use spawn eggs, plus ClientMovementPredictionSync.
+	// It exercises the relay's read/convert path for those packets live.
+	interactions bool
 }
 
 var verbose bool
@@ -231,6 +236,81 @@ func isDeadline(err error) bool {
 	}
 	return errors.Is(err, context.DeadlineExceeded) ||
 		strings.Contains(strings.ToLower(err.Error()), "deadline exceeded")
+}
+
+// sendInteractions writes every C2H packet family measured in the live GUI
+// session of 21:02-21:08, plus the other families a player touches while
+// placing/clicking blocks and using spawn eggs (hotbar equipment, entity
+// interaction, breaking animation, inventory requests, legacy item particles).
+// Two of these used to be silently dropped ("place block / click block / spawn
+// egg does nothing") or rejected by the host writer ("bitset size mismatch");
+// the rest are sent so the relay's ConvertToLatest read path is exercised on a
+// real host, where codecDropLogs would warn if any adapter returned nothing.
+func sendInteractions(conn *minecraft.Conn, protoID int32) error {
+	flagCount := protocol.EntityDataFlagCount
+	if protoID == 1001 {
+		flagCount = 130 // the 1001 wire layout has 130 entity data flags
+	}
+	for i := 0; i < 3; i++ {
+		if err := conn.WritePacket(&packet.ClientMovementPredictionSync{
+			ActorFlags: protocol.NewBitset(flagCount),
+		}); err != nil {
+			return fmt.Errorf("ClientMovementPredictionSync #%d: %w", i, err)
+		}
+	}
+
+	reg, err := blocktranslate.New(protoID, protoID, true, nil)
+	if err != nil {
+		return err
+	}
+	blockID, _ := reg.SourceID("minecraft:stone", nil)
+	tx := protocol.UseItemTransactionData{
+		ActionType:     protocol.UseItemActionClickBlock,
+		BlockRuntimeID: blockID,
+		BlockPosition:  protocol.BlockPos{0, -60, 0},
+		BlockFace:      1,
+	}
+	for i := 0; i < 2; i++ {
+		if err := conn.WritePacket(&packet.InventoryTransaction{TransactionData: &tx}); err != nil {
+			return fmt.Errorf("InventoryTransaction #%d: %w", i, err)
+		}
+		if err := conn.WritePacket(&packet.PlayerAuthInput{ItemInteractionData: protocol.Option(tx)}); err != nil {
+			return fmt.Errorf("PlayerAuthInput #%d: %w", i, err)
+		}
+	}
+
+	// The remaining families are deliberately benign probes: runtime IDs of 0
+	// and empty request slices do not ask the host to mutate the world, but they
+	// still pass through the relay's ConvertToLatest / codec path. A real GUI
+	// client sends these alongside the UseItem packets above.
+	extra := []struct {
+		name string
+		pk   packet.Packet
+	}{
+		{"MobEquipment", &packet.MobEquipment{
+			EntityRuntimeID: 1,
+			NewItem: protocol.ItemInstance{
+				Stack: protocol.ItemStack{BlockRuntimeID: int32(blockID)},
+			},
+		}},
+		{"Interact", &packet.Interact{ActionType: packet.InteractActionOpenInventory}},
+		{"PlayerAction", &packet.PlayerAction{EntityRuntimeID: 1, BlockFace: 1}},
+		{"Animate", &packet.Animate{ActionType: packet.AnimateActionSwingArm, EntityRuntimeID: 1}},
+		{"ItemStackRequest", &packet.ItemStackRequest{}},
+		{"SubChunkRequest", &packet.SubChunkRequest{}},
+		{"SetPlayerInventoryOptions", &packet.SetPlayerInventoryOptions{}},
+		{"LevelEvent", &packet.LevelEvent{
+			EventType: packet.ParticleTypeIconCrack,
+			EventData: int32(blockID),
+		}},
+	}
+	for _, e := range extra {
+		if err := conn.WritePacket(e.pk); err != nil {
+			return fmt.Errorf("%s: %w", e.name, err)
+		}
+	}
+	vlog("session: sent 3 prediction sync + 2 InventoryTransaction + 2 PlayerAuthInput + %d other C2H families", len(extra))
+	return nil
 }
 
 // dialRelay bounds the dial both by ctx and by a hard wall-clock limit, so a
@@ -430,6 +510,9 @@ func runSession(cfg config, codec minecraft.Protocol, index int) session {
 	}
 
 	names := []string{"connect", "spawn", "item_registry", "level_chunk", "packets_total"}
+	if cfg.interactions {
+		names = append(names, "interactions_sent")
+	}
 	if cfg.soak > 0 {
 		names = append(names, "soak_no_early_disconnect")
 	}
@@ -525,6 +608,15 @@ func runSession(cfg config, codec minecraft.Protocol, index int) session {
 			setCheck("item_registry", true, fmt.Sprintf("%d entries match blocktranslate.Items(%d)", len(gd.Items), cfg.proto))
 		} else {
 			setCheck("item_registry", false, fmt.Sprintf("%d GameData entries differ from the %d pinned %d entries", len(gd.Items), len(want), cfg.proto))
+		}
+	}
+
+	if cfg.interactions {
+		if err := sendInteractions(conn, cfg.proto); err != nil {
+			vlog("session %d: interaction write failed: %v", index+1, err)
+			setCheck("interactions_sent", false, err.Error())
+		} else {
+			setCheck("interactions_sent", true, "3 prediction sync + 2 use-item transactions + 2 auth-input interactions + 8 other C2H families")
 		}
 	}
 
@@ -682,6 +774,7 @@ func run() int {
 		lanAddr      = flag.String("lan-addr", "127.0.0.1:7551", "UDP signalling address of the relay when -lan-join is set")
 		networkID    = flag.String("network-id", "", "relay network ID for -lan-join (empty = discover it from the relay's LAN ResponsePacket)")
 		lanTimeout   = flag.Duration("lan-timeout", 6*time.Second, "how long to wait for the relay's LAN world card when -lan-join is set")
+		interactions = flag.Bool("interactions", false, "after spawn, send the C2H interaction packets (prediction sync, ClickBlock transaction, PlayerAuthInput.ItemInteractionData) to exercise the relay translation live")
 	)
 	flag.Parse()
 	verbose = *verboseFlag
@@ -698,6 +791,7 @@ func run() int {
 		lanAddr:      *lanAddr,
 		networkID:    *networkID,
 		lanTimeout:   *lanTimeout,
+		interactions: *interactions,
 	}
 	if cfg.spawnTimeout <= 0 || cfg.soak < 0 || cfg.reconnect < 0 {
 		fmt.Fprintln(os.Stderr, "selfcheck: -spawn-timeout must be > 0, -soak and -reconnect must be >= 0")

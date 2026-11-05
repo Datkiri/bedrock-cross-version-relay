@@ -594,6 +594,54 @@ func legacyPreludeFromHost(id uint32, raw *atomic.Pointer[[]byte], sent *atomic.
 	return target.ConvertFromLatest(decoded, nil), true
 }
 
+// codecDropLogs bounds the "adapter returned nothing" warning: a client can
+// spam one packet type, and an unexplained silent drop is exactly the sort of
+// thing that made the interaction bug invisible for so long.
+var codecDropLogs atomic.Int64
+
+// ConvertToLatest runs when READING from the client conn (C->H). It fixes the
+// two protocol-version-dependent surfaces the pinned adapters cannot handle:
+//
+//  1. INTERACTION PACKETS (InventoryTransaction / PlayerAuthInput.ItemInteractionData):
+//     hashed BlockRuntimeIDs make the registry-aware adapter return an EMPTY
+//     slice, silently dropping every block click/placement/spawn-egg use.
+//     scrubInteractionBlocks hides those IDs while the adapter translates item
+//     IDs, then restores them verbatim (see the comment on that function).
+//
+//  2. ClientMovementPredictionSync.ActorFlags: a 1001 client sends 130 flags;
+//     the native 2193 writer used on the host conn demands 131. Left alone, the
+//     host write panics with "bitset size mismatch: expected 131, got 130" and
+//     the relay DROPS the packet (measured live 21:02-21:06: 13 drops / 6 min),
+//     so the host never receives movement prediction and rolls the player back.
+//     host1001Protocol.ConvertFromLatest does the INVERSE (131 -> 130) for a
+//     1001 host; growing here keeps the two directions symmetric. resizeBitset
+//     pads the new flag with 0, which is correct for a flag the old client never
+//     knew about.
+func (p clientVersionProtocol) ConvertToLatest(pk packet.Packet, conn *minecraft.Conn) []packet.Packet {
+	// The 1001/2168/2169 wire pools hand ReadPacket a *translatedPacket wrapper
+	// whose data lives in the unexported `inner` field. Scrub THAT packet, not
+	// the wrapper: the adapter unwraps it before convertGameplayToLatest runs.
+	// unwrapWirePacket (already used for StartGame) handles both 2169 and 1001.
+	restore, scrubbed := scrubInteractionBlocks(unwrapWirePacket(pk))
+	out := p.Protocol.ConvertToLatest(pk, conn)
+	if len(out) == 0 && codecDropLogs.Add(1) <= 5 {
+		slog.Warn("xvrelay: client codec returned no packets (packet dropped at read)", "type", fmt.Sprintf("%T", pk))
+	}
+	for i, q := range out {
+		if scrubbed {
+			restore(unwrapWirePacket(q))
+		}
+		sync, ok := q.(*packet.ClientMovementPredictionSync)
+		if !ok || sync.ActorFlags.Len() == protocol.EntityDataFlagCount {
+			continue
+		}
+		cloned := *sync
+		cloned.ActorFlags = resizeBitset(sync.ActorFlags, protocol.EntityDataFlagCount)
+		out[i] = &cloned
+	}
+	return out
+}
+
 // ConvertFromLatest is the heart of the translator.
 func (p clientVersionProtocol) ConvertFromLatest(pk packet.Packet, conn *minecraft.Conn) []packet.Packet {
 	if conn == nil {
@@ -1425,6 +1473,19 @@ func relay(from, to *minecraft.Conn, dir string, trace int) {
 			}
 		}
 		if dir == "C->H" {
+			// A registry-aware client codec already translated item and block IDs in
+			// ConvertToLatest (client conn read). Running the reverse block mapper on
+			// those NATIVE IDs is a DOUBLE MAP: the clicked/placed block silently
+			// becomes the info_update placeholder. See translateC2HInteractions.
+			// Only the wire-only codecs need the manual reverse mapping.
+			if value, ok := sessions.Load(from); ok {
+				translated, err := translateC2HInteractions(value.(*session), pk, adapterHasRegistry(from.Proto().ID()))
+				if err != nil {
+					slog.Error("xvrelay: clicked block translation failed; closing session", "error", err)
+					return
+				}
+				pk = translated
+			}
 			// ★ Measuring the 6-asked/3-answered gap: log the EXACT offsets the client asked for
 			// so they can be matched against the AUDIT entry of the returned SubChunk (capped at
 			// 12 requests per session to keep the noise down).
@@ -1444,17 +1505,6 @@ func relay(from, to *minecraft.Conn, dir string, trace int) {
 							"pos", fmt.Sprintf("[%d %d %d]", req.Position[0], req.Position[1], req.Position[2]),
 							"soOffset", len(req.Offsets), "offsets", strings.Join(offs, " "))
 					}
-				}
-			}
-			if value, ok := sessions.Load(from); ok {
-				s := value.(*session)
-				if s.reverseBlocks != nil {
-					translated, err := s.reverseBlocks.TranslateInteractions(pk)
-					if err != nil {
-						slog.Error("xvrelay: clicked block translation failed; closing session", "error", err)
-						return
-					}
-					pk = translated
 				}
 			}
 		}

@@ -42,14 +42,40 @@ func TestNetherNetIngressLoopback(t *testing.T) {
 
 	// Both sides need to know each other's UDP address: Signal() resolves a peer
 	// by network ID and refuses with "no address known" otherwise. Each side
-	// therefore broadcasts a LAN RequestPacket to the other's port. The ports
-	// are only known AFTER Listen(), so hand each Options a mutable *UDPAddr and
-	// fill the ports in once both sockets exist (broadcastLoop re-reads them on
-	// every 2 s tick).
-	peerOfRelay := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
-	peerOfClient := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	// therefore broadcasts a LAN RequestPacket to the other's port.
+	//
+	// ★ Race fix (found under `go test -race`): the old version passed mutable
+	// *UDPAddr values with Port=0 into ExtraBroadcasts and then wrote `.Port`
+	// after Listen(). broadcastLoop calls send() IMMEDIATELY in its own
+	// goroutine, so that write raced UDPConn.WriteTo reading the address.
+	// Reserve both ports up front instead, and never mutate an address that a
+	// Signaling goroutine can see.
+	// Keep BOTH probe sockets open at once so the OS is forced to hand out two
+	// distinct ephemeral ports (closing the first before probing the second can
+	// legitimately return the same port twice).
+	reservePorts := func() (int, int) {
+		a, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			_ = a.Close()
+			t.Fatal(err)
+		}
+		pa := a.LocalAddr().(*net.UDPAddr).Port
+		pb := b.LocalAddr().(*net.UDPAddr).Port
+		_ = a.Close()
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return pa, pb
+	}
+	relayPort, clientPort := reservePorts()
+	peerOfRelay := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: relayPort}
+	peerOfClient := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: clientPort}
 	relaySig, err := lansignal.Listen(lansignal.Options{
-		Addr: "127.0.0.1:0", Log: log,
+		Addr: fmt.Sprintf("127.0.0.1:%d", relayPort), Log: log,
 		ExtraBroadcasts: []*net.UDPAddr{peerOfClient},
 	})
 	if err != nil {
@@ -57,15 +83,13 @@ func TestNetherNetIngressLoopback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = relaySig.Close() })
 	clientSig, err := lansignal.Listen(lansignal.Options{
-		Addr: "127.0.0.1:0", Log: log,
+		Addr: fmt.Sprintf("127.0.0.1:%d", clientPort), Log: log,
 		ExtraBroadcasts: []*net.UDPAddr{peerOfRelay},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = clientSig.Close() })
-	peerOfRelay.Port = relaySig.LocalAddr().(*net.UDPAddr).Port
-	peerOfClient.Port = clientSig.LocalAddr().(*net.UDPAddr).Port
 
 	relayID := mustParseID(t, relaySig.NetworkID())
 	clientID := mustParseID(t, clientSig.NetworkID())
