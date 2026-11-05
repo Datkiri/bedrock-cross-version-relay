@@ -369,12 +369,13 @@ Honest scope, because "it builds" and "it works" are different claims.
   (`ILwHee`, protocol `1001`, `1.26.32`) joined a `2193` LAN world through the relay on
   `0.0.0.0:19164` and stayed 6 minutes. Its relay log exposed two silent C→H defects (hashed
   `BlockRuntimeID` transactions dropped at read time, and 130-vs-131 `ActorFlags` bitsets rejected
-  at host write). Both are fixed at the root cause and covered by offline tests plus
+  at host write) and, after a human re-test, an H→C defect (hashed `UpdateBlock` IDs corrupted by
+  the client codec). All three are fixed at the root cause and covered by offline tests plus
   `selfcheck -interactions`. Re-verified with the rebuilt binary: **8/8 sessions** (all four
   protocols + `-reconnect 3`), `level=ERROR` **0**, `dropped 1 packet` **0**,
   `bitset size mismatch` **0**, `client codec returned no packets` **0**, C→H tally `skipped=0`
   with `InventoryTransaction=2` and `ClientMovementPredictionSync=3` per session. See
-  "GUI interaction translation (C2H)".
+  "GUI interaction translation (C2H)" and "GUI block-render translation (H→C)".
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, required/encrypted resource
@@ -401,6 +402,7 @@ index; the detailed numbers and boundaries live in the linked sections above.
 | #26 | Census extractor covers all 8 H2C families + direction audit of the 10 codec families | `58691e0` / `42030933432` | `stacksFrom()` now handles **8/8 H2C** families; the other 2 are **C2H** and provably cannot reach a client. Re-measured 4 protocols `5118/5121/5120/5620`, `lost=0 unknown=0 ok=true`; `AddPlayer` / `MobArmourEquipment` never occur in the 1-player lab, so the wider extractor does not inflate the count |
 | #27 | Live two-machine LAN join with `selfcheck -lan-join` + two NetherNet fixes | `b0a3fe3` / `42037071018` | Real LAN world on another machine (`192.168.1.119:7551`, `My World`, proto `2193`): **13/13** sessions connected / dialled / spawned; `level=ERROR` **0** (was 8 `non-offer signal`), `dropped 1 packet` **0** (was 592), `relay write end (destination closed)` 5. `-reconnect 3` → 4/4 OK; sequential `1001`/`2168`/`2169` → 3/3 OK. Full `go test -race ./...` clean. Measured upstream constraint: the LAN host accepts only one active NetherNet connection at a time |
 | #28–#32 | GUI interaction translation (C2H): hashed `UseItem` IDs, no double-map, 130→131 prediction-sync bitset, `selfcheck -interactions` | `c36079c` / `42048437016` | Real GUI client log (`ILwHee`, `1001` → `2193`, 6 min): 13 `bitset size mismatch` drops → **0**. Re-verified **8/8** sessions (four protocols + `-reconnect 3`), `level=ERROR` **0**, `dropped 1 packet` **0**, `client codec returned no packets` **0**, every C→H tally `skipped=0` with `InventoryTransaction=2` + `ClientMovementPredictionSync=3` + 8 other families. Offline **33/33** codec×family no-drop cases + **3/3** hashed `MobEquipment` value checks. Full `go test -race ./...` clean (also fixed a real `*net.UDPAddr` data race in `TestNetherNetIngressLoopback`) |
+| #33–#36 | GUI block-render translation (H→C): hashed `StateHash` IDs corrupted by the client codec | `e950d46` / `42060328231` | Measured stone hash `0x80310e21` → `0x3326` on `1001`, `0x353d` on `2168`/`2169` for `UpdateBlock`, `UpdateBlockSynced`, `UpdateSubChunkBlocks`, `LevelEvent`, `LevelSoundEvent` and nested `ItemStack.BlockRuntimeID`. `scrubHashedBlockIDs` + hashed-aware `adapterMapsBlocks` + **keyed** (not positional) restore after measuring that creative/recipe filtering corrupted 1812/1933 surviving hashes. Offline **39/39** (3 protocols × 13 H→C families) + gate/restore/adapter/alignment tests, creative 2076→1933/1976/1976 with 0 wrong hashes, recipes 8→7. Live **8/8** sessions against the real LAN world: `level=ERROR` 0, `dropped 1 packet` 0, `client codec returned no packets` 0, `bitset size mismatch` 0, unmatched restore 0, all tallies `skipped=0`. Full `go test -race ./...` clean |
 
 Only #19, the live parts of #21, #22 and #26 needed the BDS lab; #20, #23, #24 and the #21
 loopback harness are fully offline. #27 and #28–#32 were measured against a real LAN world on
@@ -420,9 +422,13 @@ packages (2026-11-05); race coverage is therefore not limited to the three targe
 - **Real GUI game-client interaction is still user-side verification.** `cmd/selfcheck -interactions`
   is headless: it sends the same 15 C→H packet families a GUI player uses (place/click blocks,
   spawn eggs, hotbar, entity interact) and pins that none is dropped or mis-mapped, but it does not
-  render an inventory or move a real avatar. The 6-minute GUI session that exposed these defects
-  (`ILwHee`, `1001` → `2193`) is measured; a human re-test of every interaction in the real client
-  is the remaining manual step. See "GUI interaction translation (C2H)".
+  render an inventory or move a real avatar. The H→C block-render fix is pinned by offline codec
+  tests (**39/39**) plus the creative/recipe alignment regressions (2076→1933/1976/1976 with 0
+  wrong hashes), not by a human watching a placed block turn into the right block. The 6-minute
+  GUI session that exposed the C→H defects (`ILwHee`, `1001` → `2193`) and the later "render block
+  placed/broken" report are measured; a human re-test of every interaction in the real client is
+  the remaining manual step. See "GUI interaction translation (C2H)" and "GUI block-render
+  translation (H→C)".
 - **Windows launch trap (measured, not a code bug):** `Start-Process -FilePath dist/xvrelay`
   resolves to `dist/xvrelay.exe`. If an older `dist/xvrelay.exe` is left beside a freshly built
   extensionless `dist/xvrelay`, the relay silently runs the stale binary and reproduces old bugs
@@ -563,8 +569,8 @@ cmd/xvrelay/audit.go         re-parse client-bound chunks, check state IDs again
 cmd/xvrelay/host_recipes1001.go  recipe / creative-item / movement-bitset handling for 1001 hosts
 cmd/xvrelay/host_creative1001_test.go  pins host-1001 creative IDs -> native 2193 IDs
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
-cmd/xvrelay/block_translation.go  H2C palette translation + C2H interaction scrub / no-double-map / prediction-sync bitset resize
-cmd/xvrelay/block_translation_test.go  offline C2H regression tests: hashed UseItem IDs, wrapper unwrap, 33 codec x family no-drop cases
+cmd/xvrelay/block_translation.go  H2C palette translation + C2H interaction scrub / no-double-map / prediction-sync bitset resize + H2C hashed StateHash guard (scrubHashedBlockIDs with keyed restore, hashed-aware adapterMapsBlocks)
+cmd/xvrelay/block_translation_test.go  offline C2H regression tests (hashed UseItem IDs, wrapper unwrap, 33 codec x family no-drop) + H2C hashed block-ID tests (3 protocols x 13 families, numeric gate, input restore, adapterMapsBlocks, creative/recipe alignment)
 cmd/xvrelay/bench_test.go        hot-path benchmarks (codec / item / chunk) + fixture validity test
 cmd/xvrelay/concurrency_test.go  8-session loopback concurrency / isolation / leak / race harness
 cmd/xvrelay/packs.go        CONN-005 pack policy + per-dial guard + host-Protocol sniff wrapper
@@ -927,6 +933,63 @@ from an earlier build produced a log that still showed the old `bitset size mism
 missing `InventoryTransaction`, which looked like a failed fix. Keep **both** filenames built from
 the same source (or always pass the explicit `.exe` path) before restarting the relay; the two
 binaries were verified identical with `sha256sum`.
+
+### GUI block-render translation (H→C)
+
+The same GUI client that exposed the C→H defects later reported **"block placed / broken renders
+the wrong block"**. That is the *other* direction: with `UseBlockNetworkIDHashes=true` the relay
+sends the client dynamic `UpdateBlock` packets whose `NewBlockRuntimeID` is a 32-bit **StateHash**,
+not a numeric runtime ID. `NewWithRegistries` is built for numeric IDs, so it calls
+`NativeToTarget(hash)`, misses, and substitutes an unrelated numeric ID. Measured offline with
+`minecraft:stone` (`0x80310e21`):
+
+| Target protocol | `UpdateBlock.NewBlockRuntimeID` after `ConvertFromLatest` |
+| --- | --- |
+| `1001` | `0x3326` |
+| `2168` / `2169` | `0x353d` |
+
+The corruption is not limited to `UpdateBlock`. The pinned adapters map block IDs in
+`UpdateBlockSynced`, `UpdateSubChunkBlocks`, packed `LevelEvent.EventData` (destroy/crack/legacy
+block particles), `LevelSoundEvent.ExtraData` and every `ItemStack.BlockRuntimeID` nested in the
+item-carrying H→C families. A live tally from the 6-minute GUI session had **104 `UpdateBlock`**,
+32 `LevelEvent` and 12 `LevelSoundEvent` — every one of them wrong.
+
+Fix (`cmd/xvrelay/block_translation.go`, `cmd/xvrelay/main.go`):
+
+- `scrubHashedBlockIDs()` hides those IDs from the adapter before `ConvertFromLatest`, then restores
+  them **verbatim** on every converted packet. A bounded reflection walker finds every settable
+  `*BlockRuntimeID` field (including nested `ItemStack` / `BlockChangeEntry` slices); packed
+  `LevelEvent` / `LevelSoundEvent` data is saved and restored separately. Zeroing (rather than
+  post-correcting) guarantees `mapLevelEventData` / `MapLevelSoundBlockRuntimeID` never return
+  false and drop the packet.
+- **Restore is keyed, not positional.** `targetCreativeContent` drops native items with no target
+  counterpart (2076 → **1933** on `1001`, **1976** on `2168`/`2169`) and `mapCraftingData` filters
+  recipes. A flat `saved[i] -> output[i]` restore therefore shifted from the first dropped element:
+  measured **1812/1933** surviving creative items got the wrong `StateHash` from item 121 onward.
+  Each field is now keyed by a structural path where `CreativeItemNetworkID` / `RecipeNetworkID`
+  replace the slice index; those IDs are deliberately preserved by the pinned adapters. Fixed-length
+  lists (inventory slots, recipe outputs, group icons, block-change entries) still use their index.
+- The guard is gated on `conn.GameData().UseBlockNetworkIDHashes`; numeric (non-hashed) sessions
+  still get the adapter's legitimate numeric mapping. `conn == nil` (unit tests /
+  `verifyRoundTrip`) assumes the protocol-independent hashed representation.
+- The deferred restore also restores the **input** packet, because `verifyRoundTrip` calls
+  `ConvertFromLatest(pk, nil)` and discards its result; without that, the real `WritePacket` would
+  send zeros.
+- `adapterMapsBlocks(clientProto, pk, hashed)` now returns true for all non-chunk packets in hashed
+  mode, so `blocktranslate` no longer replaces unknown pack hashes with the `info_update`
+  placeholder. Chunk payloads still go through `blocktranslate` for the v8→v9 / request-mode
+  structural rewrite.
+
+Offline coverage: `TestHashedBlockIDsSurviveClientCodec` — **3 protocols × 13 H→C families =
+39/39** (`UpdateBlock`, `UpdateBlockSynced`, `UpdateSubChunkBlocks` Blocks/Extra, three
+`LevelEvent` variants, `LevelSoundEvent/Place`, `InventoryContent`, `MobEquipment`,
+`CreativeContent`, `AddItemActor`, `InventoryTransaction/UseItem`); plus
+`TestHashedBlockScrubGate` (numeric mode stays unguarded), `TestHashedBlockScrubRestoresInput`
+(verify/dump path) and `TestAdapterMapsBlocksHashed`. The alignment fix is pinned by
+`TestHashedBlockRestoreIsAlignmentProof` (a synthetic dropped creative item), and end-to-end by
+`TestHashedBlockCreativeContentSurvivesCodec` (all 2076 native items, **1933/1976/1976** survivors
+with **0** wrong hashes) and `TestHashedBlockCraftingDataSurvivesCodec` (8 → 7 recipes, hashes
+intact by `RecipeNetworkID`).
 
 ### Semantic packet coverage (`PROTO-005`)
 
