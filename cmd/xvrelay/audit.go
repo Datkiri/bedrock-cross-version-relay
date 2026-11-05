@@ -310,12 +310,22 @@ var auditOn bool
 //
 // This is a real oracle: the same Marshal, run in both directions.
 
+// targetShieldID returns the runtime ID of minecraft:shield in the client's
+// protocol table. Protocol adapters append an 8-byte BlockingTick for items
+// whose NetworkID equals ShieldID(), so a verify round-trip that hard-codes 0
+// is blind to the exact packets a real client fails to decode.
+func targetShieldID(proto minecraft.Protocol) int32 {
+	// Keep one source of truth with the relay's listener-side seeding.
+	return clientShieldID(proto.ID())
+}
+
 func verifyRoundTrip(pk packet.Packet, proto minecraft.Protocol) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("decode panic: %v", r)
 		}
 	}()
+	shield := targetShieldID(proto)
 	// Mirror the request-mode boundary before testing the target codec. Do not
 	// mutate the canonical packet which the real client converter will also use.
 	var encoded []packet.Packet
@@ -331,7 +341,7 @@ func verifyRoundTrip(pk packet.Packet, proto minecraft.Protocol) (err error) {
 	}
 	for _, wire := range encoded {
 		var buf bytes.Buffer
-		wire.Marshal(proto.NewWriter(&buf, 0))
+		wire.Marshal(proto.NewWriter(&buf, shield))
 		raw := buf.Bytes()
 		// A sentinel avoids the Reader.ByteSlice zero-length EOF artifact.
 		probe := make([]byte, len(raw)+1)
@@ -342,7 +352,7 @@ func verifyRoundTrip(pk packet.Packet, proto minecraft.Protocol) (err error) {
 			return fmt.Errorf("codec%d has no packet%d", proto.ID(), wire.ID())
 		}
 		clone := ctor()
-		clone.Marshal(proto.NewReader(rd, 0, false))
+		clone.Marshal(proto.NewReader(rd, shield, false))
 		if rd.Len() != 1 {
 			return fmt.Errorf("decode consumed %d/%d bytes (%d left over)", len(raw)+1-rd.Len(), len(raw), 1-rd.Len())
 		}

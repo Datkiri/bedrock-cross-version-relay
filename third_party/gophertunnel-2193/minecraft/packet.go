@@ -56,7 +56,7 @@ func (p *packetData) decode(conn *Conn) (pks []packet.Packet, err error) {
 
 	defer func() {
 		if recoveredErr := recover(); recoveredErr != nil {
-			err = fmt.Errorf("decode packet %T: %w", pk, recoveredErr.(error))
+			err = fmt.Errorf("decode packet %T (ID=%d): %w", pk, p.h.PacketID, recoveredErr.(error))
 		}
 		if err != nil && !errors.Is(err, unknownPacketError{}) && conn.disconnectOnInvalidPacket {
 			_ = conn.Close()
@@ -66,7 +66,7 @@ func (p *packetData) decode(conn *Conn) (pks []packet.Packet, err error) {
 	r := conn.proto.NewReader(p.payload, conn.shieldID.Load(), conn.readerLimits)
 	pk.Marshal(r)
 	if p.payload.Len() != 0 {
-		err = fmt.Errorf("decode packet %T: %v unread bytes left: 0x%x", pk, p.payload.Len(), p.payload.Bytes())
+		err = fmt.Errorf("decode packet %T (ID=%d): %v unread bytes left: 0x%x", pk, p.h.PacketID, p.payload.Len(), p.payload.Bytes())
 	}
 	if conn.disconnectOnInvalidPacket && err != nil {
 		return nil, err

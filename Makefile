@@ -5,6 +5,7 @@
 #   make matrix    # 4x4 diagnostic report -> dist/matrix.json
 #   make selfcheck # headless self-check client -> dist/selfcheck
 #   make itemaudit # offline invisible-item audit -> dist/itemaudit
+#   make clientclone # terminal, command-driven headless Bedrock client -> dist/clientclone
 #   make release   # all six platform binaries -> dist/
 #   make java      # Java translation core -> java/out, java/out-tools
 #   make java-check  # compile the Java tree and run its probes
@@ -21,7 +22,7 @@ export GOFLAGS     := -buildvcs=false
 
 PLATFORMS := linux/amd64 linux/arm64 linux/arm windows/amd64 darwin/amd64 darwin/arm64
 
-.PHONY: all build test vet matrix selfcheck itemaudit release java java-check java-clean clean fmt
+.PHONY: all build test vet matrix selfcheck itemaudit clientclone release java java-check java-clean clean fmt
 
 all: build
 
@@ -52,6 +53,11 @@ selfcheck:
 itemaudit:
 	@mkdir -p $(DIST)
 	go build -trimpath -o $(DIST)/itemaudit ./cmd/itemaudit
+
+# Terminal-only, command-driven Bedrock client for live relay/BDS tests without a GUI.
+clientclone:
+	@mkdir -p $(DIST)
+	go build -trimpath -o $(DIST)/clientclone ./cmd/clientclone
 
 release:
 	@mkdir -p $(DIST)

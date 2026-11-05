@@ -997,6 +997,23 @@ func proto1001() minecraft.Protocol {
 // Measured in internal/blocktranslate/items_test.go:TestItemRegistryMatchesCodec — the tables
 // returned by blocktranslate.Items are exactly what the registry-aware codecs emit, and
 // v1_26_45.New() passes all 2076 native entries through unchanged.
+// clientShieldID returns the runtime ID of minecraft:shield in the client's
+// own protocol table. This is the ID the client uses when decoding item
+// stacks; a listener-side Conn must encode with exactly the same value.
+// Measured: 1001 => 387, 2168/2169/2193 => 358 (native 2193 is also 358).
+func clientShieldID(clientProto int32) int32 {
+	items, err := blocktranslate.Items(clientProto)
+	if err != nil {
+		return 0
+	}
+	for _, e := range items {
+		if e.Name == "minecraft:shield" {
+			return int32(e.RuntimeID)
+		}
+	}
+	return 0
+}
+
 func clientItemRegistry(clientProto int32) ([]protocol.ItemEntry, string, error) {
 	// Ensure the cached adapter has been built; sync.Once makes later calls free
 	// and also establishes the happens-before for reading the registry flags.
@@ -2268,6 +2285,20 @@ func handleConn(ctx context.Context, client *minecraft.Conn, ls *lansignal.Signa
 	slog.Info("xvrelay: world data", "world", gd.WorldName,
 		"baseGameVersion", gd.BaseGameVersion, "items", len(gd.Items), "blocks", len(gd.CustomBlocks))
 	applyDimensionFallback(&gd)
+
+	// ★ SHIELD ID (measured 2026-11-05 with cmd/clientclone + BDS 1.26.33.1):
+	// protocol adapters append an 8-byte BlockingTick to every item stack whose
+	// NetworkID equals ShieldID(). A listener-side Conn never receives an
+	// ItemRegistry from upstream (the relay raw-forwards it as packet.Unknown),
+	// so its shieldID stays 0 unless we set it. The client decodes with the
+	// shield ID from the table IT received, i.e. the client protocol's own
+	// table. Native 2193 shield=358, target 1001 shield=387: using 0 (or the
+	// native 358) made CreativeContent/CraftingData decode short (EOF).
+	if !noItems {
+		if sid := clientShieldID(client.Proto().ID()); sid != 0 {
+			client.SetShieldID(sid)
+		}
+	}
 
 	// ★ THE RELAY MUST RUN CONCURRENTLY WITH StartGame — see spawnPrefixGate.
 	var rg sync.WaitGroup

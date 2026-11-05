@@ -1,0 +1,18 @@
+// Smoke script: join a relay that is dialling a local BDS (transport=raknet).
+// Lines starting with // or # are comments. Every other line is one command.
+//   xvrelay -host-raknet 127.0.0.1:19132 -host-proto 1001 -listen 0.0.0.0:19164 -client-proto 1001
+//   clientclone -script cmd/clientclone/scripts/bds-smoke.jsonl -duration 8s -json dist/clientclone.json
+{"cmd":"join","addr":"127.0.0.1:19164","proto":1001}
+{"cmd":"wait","ms":2000}
+{"cmd":"assert","metric":"spawned","op":"==","value":true}
+{"cmd":"assert","metric":"game_data_items","op":">","value":0}
+{"cmd":"assert","metric":"packet_LevelChunk","op":">","value":0}
+{"cmd":"assert","metric":"decode_errors","op":"==","value":0}
+{"cmd":"look","yaw":0.5,"pitch":0.1}
+{"cmd":"chat","message":"clientclone smoke test"}
+{"cmd":"hotbar","slot":1}
+{"cmd":"jump"}
+{"cmd":"wait","ms":1500}
+{"cmd":"assert","metric":"auth_input","op":">","value":0}
+{"cmd":"dump"}
+{"cmd":"quit"}

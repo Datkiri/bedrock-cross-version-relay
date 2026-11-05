@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"testing"
 
 	"bedrock-cross-version-relay/internal/blocktranslate"
@@ -164,6 +165,119 @@ func TestSameWireGameDataItemsNeverDropped(t *testing.T) {
 		if adapterHasRegistry(id) && !sameItemIDs(items, native) {
 			t.Errorf("same-wire %d: registry-aware codec was not handed the %d native entries", id, len(native))
 		}
+	}
+}
+
+// shieldOf returns the runtime ID of minecraft:shield in an item table.
+func shieldOf(items []protocol.ItemEntry) int32 {
+	for _, e := range items {
+		if e.Name == "minecraft:shield" {
+			return int32(e.RuntimeID)
+		}
+	}
+	return 0
+}
+
+// TestShieldIDComesFromConvertedRegistry pins the trap that made a listener-side
+// Conn corrupt every item-bearing packet in protocol 1001.
+//
+// Measured 2026-11-05 with cmd/clientclone against a real BDS 1.26.33.1:
+//   - native 2193 table (GameData.Items): shield runtime ID 358,
+//   - target 1001 table (what the client receives): shield runtime ID 387,
+//   - v1_26_30.marshalItemUserData appends an 8-byte BlockingTick when
+//     stack.NetworkID == ShieldID(),
+//   - the relay wrote CreativeContent with shieldID=0 (and a wrong fix seeded
+//     the native 358), so the client read the packet 15158 bytes short: EOF.
+//
+// The listener must seed shieldID from the CONVERTED (wire) ItemRegistry, which
+// is what seedShieldIDFromRegistry does inside WritePacket.
+func TestShieldIDComesFromConvertedRegistry(t *testing.T) {
+	native, err := blocktranslate.NativeItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := shieldOf(native); got != 358 {
+		t.Fatalf("native 2193 shield ID changed: got %d, want 358 — update the fixture", got)
+	}
+	for id, want := range map[int32]int32{1001: 387, 2168: 358, 2169: 358, 2193: 358} {
+		items, err := blocktranslate.Items(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := shieldOf(items); got != want {
+			t.Errorf("protocol %d shield ID: got %d, want %d", id, got, want)
+		}
+		codec, ok := resolveProto(id)
+		if !ok {
+			t.Fatalf("resolveProto(%d) failed", id)
+		}
+		if got := targetShieldID(codec); got != want {
+			t.Errorf("targetShieldID(%d) = %d, want %d (verifyRoundTrip would use the wrong shield)", id, got, want)
+		}
+		if got := clientShieldID(id); got != want {
+			t.Errorf("clientShieldID(%d) = %d, want %d (the listener-side Conn would encode items with the wrong shield)", id, got, want)
+		}
+		out := codec.ConvertFromLatest(&packet.ItemRegistry{Items: native}, nil)
+		if len(out) != 1 {
+			t.Errorf("protocol %d: ConvertFromLatest(ItemRegistry) returned %d packets", id, len(out))
+			continue
+		}
+		reg, ok := out[0].(*packet.ItemRegistry)
+		if !ok {
+			t.Errorf("protocol %d: ConvertFromLatest returned %T", id, out[0])
+			continue
+		}
+		if got := shieldOf(reg.Items); got != want {
+			t.Errorf("protocol %d: converted wire registry shield = %d, want %d", id, got, want)
+		}
+		if id == 1001 && shieldOf(reg.Items) == shieldOf(native) {
+			t.Error("1001 converted registry still carries the native shield ID")
+		}
+	}
+}
+
+// TestVerifyRoundTripWithTargetShield mirrors the client's decode of an
+// item-bearing packet. A shield stack written with the real shield ID must
+// round-trip under that same ID; decoding with 0 must NOT (the 8-byte
+// BlockingTick is then missing). This is the oracle that used to be blind.
+func TestVerifyRoundTripWithTargetShield(t *testing.T) {
+	native, err := blocktranslate.NativeItems()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeShield := shieldOf(native) // canonical packets carry NATIVE 2193 IDs
+	codec, _ := resolveProto(1001)
+	shield := targetShieldID(codec)
+	if shield == 0 || nativeShield == 0 {
+		t.Fatalf("missing shield IDs: native=%d target=%d", nativeShield, shield)
+	}
+	pk := &packet.InventoryContent{
+		WindowID: 0,
+		Content: []protocol.ItemInstance{{
+			Stack: protocol.ItemStack{ItemType: protocol.ItemType{NetworkID: nativeShield}, Count: 1},
+		}},
+	}
+	if err := verifyRoundTrip(pk, codec); err != nil {
+		t.Fatalf("verifyRoundTrip with shield=%d failed: %v", shield, err)
+	}
+	// Prove the byte-layout difference the client suffered from: a shield stack
+	// gains the 8-byte BlockingTick only when the writer uses the real shield ID.
+	// (Decoding with 0 does not always error: InventoryContent hides the extra
+	// bytes inside the user-data ByteSlice, while CreativeContent reports EOF.)
+	encoded := codec.ConvertFromLatest(pk, nil)
+	if len(encoded) != 1 {
+		t.Fatalf("expected 1 encoded packet, got %d", len(encoded))
+	}
+	var withShield, withoutShield bytes.Buffer
+	encoded[0].Marshal(codec.NewWriter(&withShield, shield))
+	encoded[0].Marshal(codec.NewWriter(&withoutShield, 0))
+	delta := withShield.Len() - withoutShield.Len()
+	if delta != 8 {
+		t.Errorf("shield BlockingTick: encoded with shield=%d is %d bytes, with 0 is %d bytes (delta=%d, want 8)",
+			shield, withShield.Len(), withoutShield.Len(), delta)
+	} else {
+		t.Logf("shield BlockingTick: shield=%d -> %d bytes, shield=0 -> %d bytes (delta=+8)",
+			shield, withShield.Len(), withoutShield.Len())
 	}
 }
 

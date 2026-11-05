@@ -321,11 +321,12 @@ func (conn *Conn) StartGameContext(ctx context.Context, data GameData) error {
 	}
 
 	conn.gameData = data
-	for _, item := range data.Items {
-		if item.Name == "minecraft:shield" {
-			conn.shieldID.Store(int32(item.RuntimeID))
-		}
-	}
+	// Do NOT seed shieldID from data.Items here. With a registry-aware codec
+	// data.Items is the native 2193 table (shield=358) while the client decodes
+	// the target table (1001 shield=387). Callers must call SetShieldID with
+	// the client protocol's shield ID before StartGame; the relay does this,
+	// and WritePacket still seeds from a real converted ItemRegistry when one
+	// passes through (see seedShieldIDFromRegistry).
 	conn.waitingForSpawn.Store(true)
 	conn.startGame()
 
@@ -380,6 +381,39 @@ func (conn *Conn) DoSpawnContext(ctx context.Context) error {
 	}
 }
 
+// seedShieldIDFromRegistry stores the shield runtime ID from an already
+// converted (wire) ItemRegistry. Protocol adapters append an 8-byte
+// BlockingTick to item stacks whose NetworkID equals ShieldID(), so encoding
+// and decoding items with the wrong shield ID silently corrupts every
+// item-bearing packet. A listener-side Conn never receives an ItemRegistry
+// from an upstream server, so handleItemRegistry() cannot do this for it; the
+// converted table is the only place where the client's actual shield ID exists.
+func (conn *Conn) seedShieldIDFromRegistry(pks []packet.Packet) {
+	for _, pk := range pks {
+		reg, ok := pk.(*packet.ItemRegistry)
+		if !ok {
+			continue
+		}
+		for _, item := range reg.Items {
+			if item.Name == "minecraft:shield" {
+				conn.shieldID.Store(int32(item.RuntimeID))
+				return
+			}
+		}
+	}
+}
+
+// SetShieldID explicitly sets the shield runtime ID used to encode and decode
+// item stacks. Protocol adapters append an 8-byte BlockingTick to every item
+// stack whose NetworkID equals ShieldID(), so a listener-side Conn MUST use
+// the same ID the client decodes with. A relay that raw-forwards ItemRegistry
+// as a packet.Unknown never produces a real *packet.ItemRegistry, so callers
+// must set this before StartGame.
+func (conn *Conn) SetShieldID(id int32) {
+	conn.shieldID.Store(id)
+	slog.Info("gophertunnel: shieldID set explicitly", "proto", conn.proto.ID(), "shield", id)
+}
+
 // WritePacket encodes the packet passed and writes it to the Conn. The encoded data is buffered until the
 // next 20th of a second, after which the data is flushed and sent over the connection.
 func (conn *Conn) WritePacket(pk packet.Packet) error {
@@ -398,7 +432,18 @@ func (conn *Conn) WritePacket(pk packet.Packet) error {
 		internal.BufferPool.Put(buf)
 	}()
 
-	for _, converted := range conn.proto.ConvertFromLatest(pk, conn) {
+	convertedPackets := conn.proto.ConvertFromLatest(pk, conn)
+	// A listener-side Conn never receives an ItemRegistry from an upstream
+	// server, so handleItemRegistry() cannot seed shieldID for it. Protocol
+	// adapters (e.g. v1_26_30.marshalItemUserData) append an 8-byte
+	// BlockingTick to every item whose NetworkID equals ShieldID(). The
+	// listener must therefore encode AND decode items with the shield ID the
+	// client sees on the wire, which is the CONVERTED (target-protocol) table,
+	// not conn.gameData.Items (the native 2193 table). Measured 2026-11-05:
+	// native 2193 shield=358, target 1001 shield=387; writing with 0 made the
+	// client read CreativeContent short (EOF, 15158 bytes left over).
+	conn.seedShieldIDFromRegistry(convertedPackets)
+	for _, converted := range convertedPackets {
 		buf.Reset()
 		conn.hdr.PacketID = converted.ID()
 		_ = conn.hdr.Write(buf)
@@ -1153,6 +1198,10 @@ func (conn *Conn) handleResourcePackClientResponse(pk *packet.ResourcePackClient
 // startGame sends a StartGame packet using the game data of the connection.
 func (conn *Conn) startGame() {
 	data := conn.gameData
+	// shieldID is seeded by WritePacket from the CONVERTED ItemRegistry below
+	// (see seedShieldIDFromRegistry). Do not seed it from data.Items here: for a
+	// registry-aware codec data.Items is the native 2193 table (shield=358)
+	// while the client sees the target table (1001 shield=387).
 	if len(data.Dimensions) > 0 {
 		_ = conn.WritePacket(&packet.DimensionData{Definitions: data.Dimensions})
 	}

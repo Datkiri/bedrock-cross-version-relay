@@ -238,8 +238,10 @@ Honest scope, because "it builds" and "it works" are different claims.
   `shelf_mushroom` and `straw_bed` on `1001`. `go run ./cmd/itemaudit -json dist/item-audit.json`
   writes the complete name/ID list; `cmd/itemaudit/main_test.go` pins the counts and the
   protocol-1001 `translatedPacket` wire trap. This is still **not** a real client rendering an
-  inventory: Cinnabar is a GUI client (`make play`) pinned to protocol 2225 and licensed PolyForm
-  Noncommercial, so it cannot be used as a headless multi-version harness.
+  inventory. The Cinnabar desktop app is GUI-based (`make play`), pinned to protocol 2225 and
+  licensed PolyForm Noncommercial, so **no code from it is used here**; its Go core
+  (`core/cmd/bedrock-core`, `core/proxy/local_bds_live_test.go`) served only as a behavioural
+  reference for the separate MIT terminal client `cmd/clientclone` described below.
 - **Live self-check (headless):** `cmd/selfcheck` is an independent terminal Bedrock client. It
   dials the relay's RakNet listener, spawns, counts 18 packet families, checks `GameData().Items`
   against the expected table, samples heap/goroutines, supports `-reconnect` and `-soak`, writes a
@@ -249,6 +251,17 @@ Honest scope, because "it builds" and "it works" are different claims.
   spawning with 921 LevelChunks, `registry=true`, `soak_complete`, `OK=true`, exit 0:
   `1001` 1239 packets / `items=1933`, `2168` 1217 / 1976, `2169` 1304 / 1976,
   `2193` 1654 / 2076. That is four live client→relay→BDS paths, still not all 16 protocol pairs.
+- **Live command-driven client (headless):** `cmd/clientclone` is a terminal Bedrock client driven
+  by one JSON command per line. It joins the relay (or a BDS directly), spawns, sends 20 Hz
+  `PlayerAuthInput`, echoes latency, answers forms, requests subchunks, asserts packet counters and
+  writes a JSON report. Against the same BDS 1.26.33.1 it found and then verified the fix for a
+  listener-side `shieldID` bug: before the fix `1001` reported `decode_errors=2`,
+  `bad_packets=2`, `command_failures=1`, `ok=false` and dropped `CreativeContent`/`CraftingData`
+  with `EOF`; after the fix it reports `decode_errors=0`, `packets_total=1252` (was 882),
+  `CreativeContent=2`, `CraftingData=1`, `ok=true`, exit 0. All four client protocols then passed
+  (`1001` shield 387, `2168`/`2169`/`2193` shield 358; all `spawned=true`, `decode_errors=0`).
+  `cmd/xvrelay/item_registry_test.go` pins the shield IDs, the `+8` byte `BlockingTick` delta and
+  the round-trip oracle. This is a headless codec-level client, not a rendering game client.
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, resource packs, biomes, entity
@@ -296,6 +309,16 @@ Honest scope, because "it builds" and "it works" are different claims.
   `[-32768, 32767]` therefore cannot survive the wire at all, independently of the relay.
   `cmd/itemaudit` logs this case separately (`WIRE_INT16_TRUNCATION`) so it is not mistaken for
   a missing item.
+- **Listener-side `shieldID` was silently wrong until 2026-11-05 — now fixed.** Protocol adapters
+  append an 8-byte `BlockingTick` to every item stack whose `NetworkID == ShieldID()`. A
+  listener-side `Conn` never receives an `ItemRegistry` from upstream — the relay raw-forwards it
+  as a `packet.Unknown` — so it encoded items with `shieldID=0` while the client decoded with the
+  shield ID from the table it received. Native 2193 is `358`, target 1001 is `387`, so seeding from
+  `GameData.Items` (the native table) is wrong too. The relay now calls
+  `Conn.SetShieldID(clientShieldID(...))` before `StartGame`, and `verifyRoundTrip()` uses the
+  same target shield instead of hard-coding `0`. Measured with `cmd/clientclone` on a real BDS:
+  before `decode_errors=2` / `packets_total=882` (CreativeContent + CraftingData dropped with
+  `EOF`), after `decode_errors=0` / `packets_total=1252`. See the terminal-client section below.
 - **Ingress is RakNet only.** Clients reach the relay over RakNet; NetherNet is used for LAN discovery
   (UDP 7551) and, by default, for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`).
   `-host-raknet` replaces that host leg with a plain RakNet dial for a BDS configured with
@@ -339,6 +362,7 @@ cmd/xvrelay/host_recipes1001.go  recipe / movement-bitset handling for 1001 host
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
+cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
 internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address)
 internal/mcport/          Minecraft port detection helpers
@@ -358,6 +382,7 @@ make test      # go test ./...
 make vet
 make selfcheck # headless self-check client -> dist/selfcheck
 make itemaudit # offline invisible-item audit -> dist/itemaudit
+make clientclone # terminal, command-driven headless client -> dist/clientclone
 make release   # linux/amd64, linux/arm64, linux/arm, windows/amd64, darwin/amd64, darwin/arm64
 ```
 
@@ -391,6 +416,58 @@ toolchain runs the test in) and its parent directory is created if missing, so t
 clone where `dist/` does not exist yet. The test **skips** when `XVER_MATRIX_REPORT` is unset, so a
 plain `go test ./...` does not run it — silence there is not a pass.
 
+### Terminal client clone (headless, command-driven)
+
+`cmd/clientclone` is the custom terminal Bedrock client for testing a relay (or a BDS directly)
+without a real game client and without a GUI. It is **not** a copy of Cinnabar: that project is
+licensed PolyForm Noncommercial 1.0.0, its desktop app is pinned to protocol `2225`, and
+`make play` opens a GUI launcher. Only measured client behaviour was reused (a deterministic
+`login.ClientData` with skin, 20 Hz `PlayerAuthInput`, latency echo, resource-pack handshake,
+chunk-radius / subchunk requests, form responses, `SetLocalPlayerAsInitialised` via
+`DoSpawnContext`). The client speaks to the relay's RakNet listener (or to a BDS with `-direct`)
+using this repository's own `1001`/`2168`/`2169`/`2193` codecs.
+
+One JSON command per line, from `-script` or stdin. Every command answers with one JSON line;
+`-json` writes a final report whose assertions fail a broken session.
+
+```bash
+make clientclone
+./dist/xvrelay -host-raknet 127.0.0.1:19132 -host-proto 1001 \
+  -listen 0.0.0.0:19164 -client-proto auto -verify
+./dist/clientclone -script cmd/clientclone/scripts/bds-smoke.jsonl \
+  -duration 12s -json dist/clientclone.json
+# or drive the four-protocol matrix without editing the script:
+./dist/clientclone -auto -addr 127.0.0.1:19164 -proto 2193 \
+  -script cmd/clientclone/scripts/bds-smoke.jsonl -duration 12s
+```
+
+Commands: `join`, `wait`, `move`, `look`, `jump`, `sneak`, `sprint`, `chat`, `hotbar`, `form`,
+`assert`, `dump`, `quit`. `assert` supports `>`, `>=`, `<`, `<=`, `==`, `!=` and `contains`
+against any metric listed by `dump`. `-auto` joins at startup from `-addr` / `-direct` / `-proto`.
+Bisect flags: `-no-input`, `-no-subchunk`, `-input-flags`, `-nofail`, `-v`.
+
+**Bug this client found and verified (2026-11-05).** On a real BDS 1.26.33.1
+(`transport=raknet`) with a `1001` client, the first live run reported `decode_errors=2`,
+`bad_packets=2`, `command_failures=1`, `ok=false` and
+`read packet: decode packet *v1_26_30.translatedPacket (ID=145): EOF`. The dumped raw payload
+decoded cleanly with `shieldID=0` but failed with `387` (15158 bytes left over). Root cause:
+protocol adapters append an 8-byte `BlockingTick` to every item stack whose `NetworkID ==
+ShieldID()`, and the listener-side `Conn` never receives an `ItemRegistry` from upstream — the
+relay raw-forwards it as a `packet.Unknown` — so its `shieldID` stayed `0`. Native 2193 shield is
+`358`, target 1001 shield is `387`, so seeding from `GameData.Items` (native) is also wrong. The
+relay now calls `Conn.SetShieldID(clientShieldID(...))` before `StartGame`; `verifyRoundTrip()`
+uses the same target shield instead of hard-coding `0`; `item_registry_test.go` pins both IDs,
+the `+8` byte wire delta and the oracle (an `InventoryContent` shield stack encodes to 38 bytes
+with shield `387` and 30 bytes with `0`).
+
+**Live result after the fix** (same BDS, same script): `decode_errors=0`, `bad_packets=0`,
+`command_failures=0`, `spawned=true`, `packets_total=1252` (was 882), `CreativeContent=2`
+(was 1), `CraftingData=1` (was dropped), `AddItemActor=1`, `ok=true`, exit 0. A four-protocol run
+— one session at a time, because this BDS accepts only one direct RakNet host dial at a time —
+gave `1001` shield `387`, `2168`/`2169`/`2193` shield `358`, all with `spawned=true`,
+`decode_errors=0`, `command_failures=0`, `ok=true`. This is a headless codec-level client: it
+does **not** render an inventory and does not replace a real game client.
+
 ### Invisible-item audit
 
 `cmd/itemaudit` is offline and needs no BDS, listener, account or GUI client. It logs every item
@@ -414,7 +491,7 @@ decoding through `codec.Packets(false)` leaves 0.
 
 Measured baseline (2026-11-05, CGO disabled): `go build -buildvcs=false ./...`,
 `go vet ./...`, `go test -buildvcs=false ./...` all pass, including `cmd/selfcheck`,
-`cmd/itemaudit` and the five `item_gameplay_test.go` assertions; all six release targets cross-compile
+`cmd/itemaudit`, `cmd/clientclone` and the five `item_gameplay_test.go` assertions; all six release targets cross-compile
 (`linux amd64/arm64/arm`, `windows amd64`, `darwin amd64/arm64`);
 `go test -race ./cmd/xvrelay ./internal/blocktranslate` passes with CGO enabled. Four tests are
 opt-in and skip by default: `TestProtocolCompatibilityMatrix` (`XVER_MATRIX_REPORT`),
