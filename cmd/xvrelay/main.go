@@ -2646,7 +2646,9 @@ func directWorld(addr string) lansignal.World {
 }
 
 func main() {
-	listenAddr := flag.String("listen", "0.0.0.0:19164", "address to listen on for clients")
+	listenAddr := flag.String("listen", "0.0.0.0:19164", "address to listen on for clients (RakNet ingress; ignored with -listen-nethernet)")
+	listenNethernet := flag.Bool("listen-nethernet", false,
+		"CONN-002: accept clients over NetherNet/WebRTC LAN discovery instead of RakNet. The relay advertises on UDP 7551 through lansignal and reuses it as the signaling backend; -listen is ignored")
 	world := flag.String("world", "", "LAN world: level/host NAME (stable across re-opens) or NetworkID (empty = the only world found)")
 	timeout := flag.Duration("timeout", 20*time.Second, "how long to scan for LAN worlds")
 	trace := flag.Int("trace", 40, "print the first N packet names per direction (0 = off)")
@@ -2832,9 +2834,17 @@ func main() {
 		// from there. NoBroadcast keeps us off UDP 7551 so a real LAN host is not
 		// disturbed.
 		var err error
-		ls, err = lansignal.Listen(lansignal.Options{
+		opts := lansignal.Options{
 			Addr: "0.0.0.0:0", NoBroadcast: true, Log: slog.Default(),
-		})
+		}
+		if *listenNethernet {
+			// CONN-002: a NetherNet ingress listener must be discoverable. Clients
+			// broadcast RequestPackets to UDP 7551 and expect a ResponsePacket
+			// from that same port, so the socket cannot stay ephemeral/mute even
+			// though the HOST side is dialled directly over RakNet.
+			opts = lansignal.Options{Addr: "0.0.0.0:7551", Log: slog.Default()}
+		}
+		ls, err = lansignal.Listen(opts)
 		if err != nil {
 			slog.Error("xvrelay: direct discovery socket failed", "error", err)
 			os.Exit(1)
@@ -2842,7 +2852,8 @@ func main() {
 		w = directWorld(directHostAddr)
 		rememberWorld(w)
 		slog.Info("xvrelay: direct RakNet host mode — LAN discovery skipped",
-			"addr", directHostAddr, "network_id", w.NetworkID)
+			"addr", directHostAddr, "network_id", w.NetworkID,
+			"nethernet_ingress", *listenNethernet)
 	} else {
 		for attempt := 1; ; attempt++ {
 			var err error
@@ -3034,13 +3045,44 @@ func main() {
 	if prefetchEnabled(packCfg) {
 		prefetchHostPacks(ctx, ls, w.NetworkID)
 	}
-	listener, err := listenCfg.Listen("raknet", *listenAddr)
+	// CONN-002: the client-facing transport is either RakNet (default) or
+	// NetherNet/WebRTC. gophertunnel exposes the latter through ListenNetwork with
+	// a minecraft.NetherNet Network; the SAME lansignal.Signaling that discovers
+	// and dials the host doubles as the signaling backend for incoming offers.
+	// minecraft.Listener.Accept() still yields *minecraft.Conn, so the session
+	// pipeline below is transport-agnostic.
+	var listener *minecraft.Listener
+	var err error
+	transport := "raknet"
+	if *listenNethernet {
+		transport = "nethernet"
+		nnLog := slog.Default().With("link", "nethernet-ingress")
+		listener, err = listenCfg.ListenNetwork(minecraft.NetherNet{
+			Signaling: ls,
+			ListenConfig: nethernet.ListenConfig{
+				// LAN / self-signed clients send no 'a=identity' assertion in
+				// their offer. The Minecraft layer already has
+				// AuthenticationDisabled=true, so accept those peers here too.
+				AllowAnonymous: true,
+				Log:            nnLog,
+			},
+			Log: nnLog,
+		}, ls.NetworkID())
+	} else {
+		listener, err = listenCfg.Listen("raknet", *listenAddr)
+	}
 	if err != nil {
-		slog.Error("xvrelay: listen failed", "error", err)
+		slog.Error("xvrelay: listen failed", "transport", transport, "error", err)
 		os.Exit(1)
 	}
 	defer listener.Close()
-	slog.Info("xvrelay: listening", "addr", *listenAddr,
+	slog.Info("xvrelay: listening", "transport", transport, "addr", *listenAddr,
+		"network_id", func() string {
+			if *listenNethernet {
+				return ls.NetworkID()
+			}
+			return ""
+		}(),
 		"protocols", func() []int32 {
 			out := make([]int32, 0, len(accepted))
 			for _, p := range accepted {

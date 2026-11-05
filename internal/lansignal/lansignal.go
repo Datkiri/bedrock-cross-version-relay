@@ -109,6 +109,26 @@ type Options struct {
 	ExtraBroadcasts []*net.UDPAddr
 }
 
+// networkIDSeed guarantees unique network IDs for Signaling instances created
+// in the same process. time.Now().UnixNano() has a coarse resolution on Windows
+// (~100 ns or worse), so two Listens a few microseconds apart used to get the
+// SAME ID: readLoop then discarded the other peer's packets as "our own
+// broadcast" and Signal() could never route a CONNECTRESPONSE back.
+var networkIDSeed atomic.Uint64
+
+func nextNetworkID() uint64 {
+	id := uint64(time.Now().UnixNano())
+	for {
+		prev := networkIDSeed.Load()
+		if id <= prev {
+			id = prev + 1
+		}
+		if networkIDSeed.CompareAndSwap(prev, id) {
+			return id
+		}
+	}
+}
+
 // Listen binds the discovery socket and starts the read and broadcast loops.
 func Listen(opts Options) (*Signaling, error) {
 	if opts.Addr == "" {
@@ -126,7 +146,7 @@ func Listen(opts Options) (*Signaling, error) {
 	local, _ := conn.LocalAddr().(*net.UDPAddr)
 	s := &Signaling{
 		conn:      conn,
-		networkID: uint64(time.Now().UnixNano()),
+		networkID: nextNetworkID(),
 		log:       opts.Log,
 		peers:     make(map[uint64]*World),
 		notifiers: make(map[uint32]nethernet.Notifier),
@@ -211,11 +231,68 @@ func (s *Signaling) NetworkID() string {
 	return strconv.FormatUint(s.networkID, 10)
 }
 
-// PongData sets the ServerData used to answer incoming RequestPackets. It takes
-// the same binary ServerData payload that Minecraft puts in a ResponsePacket.
+// PongData sets the ServerData used to answer incoming RequestPackets.
+//
+// Two input formats are accepted:
+//   - the classic RakNet "MCPE;...;" pong string. This is what a gophertunnel
+//     listener produces, and what a NetherNet ingress listener forwards here
+//     every few seconds through nethernet.Listener.PongData (CONN-002);
+//   - an already-encoded ServerData blob (the original contract of this method).
+//
+// A LAN ResponsePacket carries BINARY ServerData, not the MCPE string, so the
+// former has to be converted here or LAN clients cannot display this server.
 func (s *Signaling) PongData(b []byte) {
-	cp := append([]byte(nil), b...)
-	s.pongData.Store(&cp)
+	var raw []byte
+	if strings.HasPrefix(string(b), "MCPE;") {
+		converted, err := serverDataFromPong(b)
+		if err != nil {
+			s.log.Warn("lansignal: cannot convert pong to ServerData", "error", err)
+			return
+		}
+		raw = converted
+	} else {
+		raw = append([]byte(nil), b...)
+	}
+	s.pongData.Store(&raw)
+}
+
+// serverDataFromPong converts gophertunnel's MCPE pong line into the binary
+// ServerData payload a LAN ResponsePacket expects. This mirrors the parsing in
+// go-nethernet/discovery.Listener.PongData, but also carries Protocol, Version
+// and Nonce-free defaults so the world card has a real protocol/version.
+func serverDataFromPong(b []byte) ([]byte, error) {
+	parts := strings.Split(string(b), ";")
+	if len(parts) < 9 {
+		return nil, fmt.Errorf("pong has %d fields, want >= 9", len(parts))
+	}
+	proto, _ := strconv.ParseInt(parts[2], 10, 32)
+	players, _ := strconv.Atoi(parts[4])
+	maxPlayers, _ := strconv.Atoi(parts[5])
+
+	var gameType int32
+	switch strings.ToLower(strings.TrimSpace(parts[8])) {
+	case "creative":
+		gameType = discovery.GameTypeCreative
+	case "adventure":
+		gameType = discovery.GameTypeAdventure
+	default:
+		gameType = discovery.GameTypeSurvival
+	}
+	d := &discovery.ServerData{
+		ServerName:            parts[1],
+		Protocol:              int32(proto),
+		Version:               parts[3],
+		LevelName:             parts[7],
+		GameType:              gameType,
+		PlayerCount:           int32(players),
+		MaxPlayerCount:        int32(maxPlayers),
+		EditorWorld:           false,
+		Hardcore:              false,
+		AcceptsOnlineAuth:     true,
+		AcceptsSelfSignedAuth: true,
+		ConnectionType:        4, // LAN/NetherNet, as vanilla uses.
+	}
+	return d.MarshalBinary()
 }
 
 // Credentials always returns nil: LAN discovery carries no STUN/TURN servers.
@@ -418,6 +495,13 @@ func (s *Signaling) readLoop() {
 				s.log.Warn("lansignal: bad signal", "error", err, "from", addr)
 				continue
 			}
+			// CONN-002: remember the sender BEFORE delivering the signal. When this
+			// Signaling also backs a nethernet.Listener, the CONNECTRESPONSE is sent
+			// back through Signal(), which resolves the peer by network ID. A peer
+			// that only ever sent MessagePackets would otherwise be unroutable —
+			// the exact "no address known" failure seen on a LAN host that never
+			// announces itself with a RequestPacket.
+			s.record(senderID, addr, nil)
 			signal.NetworkID = strconv.FormatUint(senderID, 10)
 			s.deliver(signal)
 		}

@@ -102,10 +102,16 @@ Then, with the world already open to LAN:
 # BDS / direct-host lab: skip LAN discovery, dial the server over RakNet
 # (requires server.properties: transport=raknet)
 ./dist/xvrelay -host-raknet 127.0.0.1:19132 -host-proto 1001 -client-proto auto -listen 127.0.0.1:19164
+
+# CONN-002: advertise on LAN and accept clients over NetherNet/WebRTC instead of
+# RakNet. -listen is ignored; clients find the relay in the LAN world list.
+./dist/xvrelay -host-raknet 127.0.0.1:19132 -host-proto 1001 -listen-nethernet
 ```
 
-Point the older/newer client at `<relay-ip>:19164` using **Add Server**. The relay logs both
-directions; `-trace 40` (default) prints the first 40 packet names per direction, `-trace 0` silences it.
+Point the older/newer client at `<relay-ip>:19164` using **Add Server** (RakNet ingress, the
+default). With `-listen-nethernet` the relay instead appears as a LAN world on UDP 7551 and is
+joined through NetherNet; see "NetherNet ingress (CONN-002)". The relay logs both directions;
+`-trace 40` (default) prints the first 40 packet names per direction, `-trace 0` silences it.
 
 For an automated check without a game client, `cmd/selfcheck` is a headless Bedrock client that
 spawns through the relay and reports assertions as JSON:
@@ -188,7 +194,8 @@ codec.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-listen` | `0.0.0.0:19164` | address the clients connect to |
+| `-listen` | `0.0.0.0:19164` | address the clients connect to (RakNet ingress; ignored with `-listen-nethernet`) |
+| `-listen-nethernet` | off | `CONN-002`: accept clients over NetherNet/WebRTC LAN discovery instead of RakNet; the relay advertises on UDP 7551 through `lansignal` |
 | `-world` | *(auto)* | level name or NetworkID; empty = the only world found |
 | `-timeout` | `20s` | LAN discovery window |
 | `-client-proto` | `auto` | force the client-side protocol (`1001`/`2168`/`2169`/`2193`) |
@@ -326,6 +333,14 @@ Honest scope, because "it builds" and "it works" are different claims.
   (`LevelEvent` legacy item particle, `ActorEvent` feed) are mapped `882 → 878`. Biome schemas,
   generic entity metadata, spawn-particle payloads, block-entity NBT and actor identifiers are
   forwarded unchanged with **0** item IDs. See "Semantic packet coverage".
+- **NetherNet ingress (`CONN-002`, measured 2026-11-05):** `-listen-nethernet` switches the
+  client-facing listener from RakNet to NetherNet/WebRTC. `cmd/xvrelay/nethernet_ingress_test.go`
+  runs a **full loopback** — two real `lansignal.Signaling` instances, real LAN discovery, real
+  ICE/DTLS/SCTP, real `CONNECTREQUEST` → `CONNECTRESPONSE`, Minecraft Login, `StartGame`, and a
+  `Text` packet that crosses the WebRTC data channels — in ~2 s, 3/3 consecutive runs.
+  `internal/lansignal/pong_test.go` pins that a `CONNECTREQUEST` sender is routable for the answer
+  and that gophertunnel's MCPE pong string is converted to binary `ServerData` (the LAN world card
+  decoded as `Minecraft Server` / `Gophertunnel` in the loopback log). See "NetherNet ingress".
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, required/encrypted resource
@@ -396,11 +411,14 @@ Honest scope, because "it builds" and "it works" are different claims.
   same target shield instead of hard-coding `0`. Measured with `cmd/clientclone` on a real BDS:
   before `decode_errors=2` / `packets_total=882` (CreativeContent + CraftingData dropped with
   `EOF`), after `decode_errors=0` / `packets_total=1252`. See the terminal-client section below.
-- **Ingress is RakNet only.** Clients reach the relay over RakNet; NetherNet is used for LAN discovery
-  (UDP 7551) and, by default, for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`).
-  `-host-raknet` replaces that host leg with a plain RakNet dial for a BDS configured with
-  `transport=raknet`. A client that can only speak NetherNet — for example one joining through an
-  activity handle instead of the LAN list — cannot connect. This is a design boundary, not a bug.
+- **Ingress supports RakNet (default) and NetherNet (`-listen-nethernet`).** Without the flag,
+  clients reach the relay over RakNet; NetherNet is used for LAN discovery (UDP 7551) and, by
+  default, for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`). With the
+  flag, the relay also **accepts** NetherNet clients: the same `lansignal.Signaling` backs both the
+  host dial and the incoming listener. `-host-raknet` replaces the host leg with a plain RakNet
+  dial for a BDS configured with `transport=raknet`. This ingress capability does **not** change
+  the separate host-side boundary below: a BDS with `transport=nethernet` still does not answer
+  our outbound dial, so `-host-raknet` remains the measured workaround.
 - **Resource-pack prefetch is opt-in, not disabled.** The old hardcoded `if false` before
   `prefetchHostPacks` is gone. `-pack-prefetch` plus `-pack-mode download|limit` runs one extra host
   dial before the listener so even the first client gets the map's packs. Default is
@@ -415,11 +433,17 @@ Honest scope, because "it builds" and "it works" are different claims.
   re-pinned.
 - **This is a LAN-world relay.** Realms, cloud sessions, NAT traversal and matchmaking are out of scope.
 - **Partially measured, still open** (2026-11-05):
-  - `CONN-002` — NetherNet ingress is still not implemented (clients use RakNet only). A BDS with
-    `transport=nethernet` advertises `ServerData v5` (47-byte payload, `TransportLayer=2`,
-    `ConnectionType=4`) but a direct `go-nethernet` dial sent `CONNECTREQUEST` and received **no**
-    `CONNECTRESPONSE` (25 s `context deadline exceeded`). `-host-raknet` is the measured workaround,
-    not a NetherNet implementation.
+  - `CONN-002` — **implemented and loopback-measured** (2026-11-05). `-listen-nethernet` accepts
+    NetherNet clients via `minecraft.ListenConfig.ListenNetwork(minecraft.NetherNet{...})`; the
+    vendored `go-nethernet` *does* ship a full `Listener` + `Signaling` server, contrary to the
+    earlier assumption. Measured: real WebRTC/ICE/DTLS/SCTP loopback, real LAN discovery on UDP
+    7551, `CONNECTREQUEST` → `CONNECTRESPONSE`, Login, `StartGame`, and a `Text` packet round trip
+    (`cmd/xvrelay/nethernet_ingress_test.go`, 3/3 runs). Still **not** verified: a real Minecraft
+    game client joining through the LAN list, NetherNet ingress across two physical machines, and
+    Xbox Live identity assertions — `AllowAnonymous: true` is set, so offers without an
+    `a=identity` assertion are accepted. The older `CONNECTREQUEST` → no `CONNECTRESPONSE` (25 s
+    `context deadline exceeded`, `ServerData v5` 47-byte payload / `TransportLayer=2`) measurement
+    was a **host-side** dial into a BDS with `transport=nethernet`; that boundary is unchanged.
   - `CONN-004` — short reconnect (`-reconnect 3`, 4/4 OK), 3-client concurrency (3/3 OK),
     `-race` on both the offline harness and the live relay (0 races), and a 25 s soak are now
     **measured** (see "Concurrency / lifecycle"). Still **not** run: a multi-client, hours-long
@@ -463,12 +487,14 @@ cmd/xvrelay/concurrency_test.go  8-session loopback concurrency / isolation / le
 cmd/xvrelay/packs.go        CONN-005 pack policy + per-dial guard + host-Protocol sniff wrapper
 cmd/xvrelay/packs_test.go   policy / budget / real-size lie / overrun abort / skipped-pack tests
 cmd/xvrelay/semantic_coverage_test.go  PROTO-005 measured item/particle/NBT family coverage (offline)
+cmd/xvrelay/nethernet_ingress_test.go  CONN-002 full NetherNet/WebRTC ingress loopback (real ICE + Login + packet)
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
 cmd/clientclone/items.go    live wire item census: decode stacks, resolve IDs, ITEM_VISIBLE / ITEM_LOST / ITEM_UNKNOWN_ID
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
-internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address)
+internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address); also the Signaling backend for -listen-nethernet
+internal/lansignal/pong_test.go  MCPE-pong -> binary ServerData conversion + CONNECTREQUEST/RESPONSE signalling round trip
 internal/mcport/          Minecraft port detection helpers
 java/                     JVM port of the translation layer — status and scope in java/README.md
 third_party/              pinned forks of go-nethernet and gophertunnel (protocol 2193 support)
@@ -505,6 +531,14 @@ that needs CGO and a C compiler (it is not part of `make test`):
 
 ```bash
 CGO_ENABLED=1 go test -race -buildvcs=false ./cmd/xvrelay -run TestConcurrent -count=1
+```
+
+The NetherNet ingress test opens real loopback UDP/WebRTC sockets but needs no BDS, no game client
+and no Xbox service. Set `XVER_NNET_DEBUG=1` for the full ICE/Login trace when diagnosing it:
+
+```bash
+CGO_ENABLED=0 go test -buildvcs=false ./cmd/xvrelay -run TestNetherNetIngressLoopback -count=1 -v
+CGO_ENABLED=0 go test -buildvcs=false ./internal/lansignal -run 'TestPongData|TestSignalingRoundTrips' -v
 ```
 
 `-buildvcs=false` matters when this tree sits inside another git work tree.
@@ -646,6 +680,81 @@ pack was tested; required/encrypted/addon packs, multi-pack stacks and cache-onl
 (3) `-pack-overrun abort` cancels the dial context; gophertunnel's `DialContext` does not close
 the underlying connection on that path, so a host-side goroutine may linger until the transport
 disconnects — the same behaviour as the pre-existing `-dial-timeout` path.
+
+### NetherNet ingress (`CONN-002`)
+
+The old note said "NetherNet ingress is not implemented". That confused **two different
+directions**. The unimplemented/absent part was always the **host-side** leg: dialling a BDS with
+`transport=nethernet` sends `CONNECTREQUEST` and never gets `CONNECTRESPONSE` (25 s timeout). The
+**client-facing** leg is a separate question, and the answer is that the vendored libraries already
+provide everything needed:
+
+| Piece | Where | What it does |
+| --- | --- | --- |
+| `nethernet.Signaling` | `third_party/go-nethernet/signal.go` | `Signal` / `Notify` / `Credentials` / `NetworkID` / `PongData` / `Context` |
+| `nethernet.ListenConfig.Listen(signaling)` | `third_party/go-nethernet/listener.go` | receives `CONNECTREQUEST` offers, emits `CONNECTRESPONSE`, runs ICE/DTLS/SCTP, `Accept()` returns `net.Conn` |
+| `discovery.Listener` | `third_party/go-nethernet/discovery/listener.go` | LAN signalling over UDP 7551 |
+| `minecraft.NetherNet.Listen` | `third_party/gophertunnel-2193/minecraft/nethernet.go` | adapts the above to `minecraft.Network` |
+| `minecraft.ListenConfig.ListenNetwork` | `third_party/gophertunnel-2193/minecraft/listener.go` | wraps it in the standard `Listener` whose `Accept()` yields `*minecraft.Conn` |
+
+`internal/lansignal.Signaling` already implements `nethernet.Signaling` (it was written to
+*discover* LAN worlds and *dial* the host). A single instance can be both halves of a connection:
+its `NetworkID()` identifies the relay to clients, `Signal()` routes answers back by peer network
+ID, and `Notify()` fans incoming signals out to the inbound listener. So `-listen-nethernet`
+reuses the existing `ls` instead of opening a second signalling stack:
+
+```go
+listener, err = listenCfg.ListenNetwork(minecraft.NetherNet{
+    Signaling: ls,
+    ListenConfig: nethernet.ListenConfig{AllowAnonymous: true, Log: nnLog},
+    Log: nnLog,
+}, ls.NetworkID())
+```
+
+Everything downstream of `Accept()` is unchanged — it still receives `*minecraft.Conn`, so the
+spawn gate, codec wiring and host dial are transport-agnostic. `AllowAnonymous: true` is required
+because LAN / self-signed clients send no `a=identity` assertion in their offer; the Minecraft
+layer already has `AuthenticationDisabled: true`.
+
+Two supporting fixes were needed in `internal/lansignal`:
+
+| Fix | Why |
+| --- | --- |
+| `MessagePacket` now calls `record(senderID, addr, nil)` before `deliver()` | `Signal()` resolves a peer by network ID. A client that only ever sent `CONNECTREQUEST` (never a LAN `RequestPacket`) was previously unroutable → `no address known for network ID`. |
+| `PongData()` converts a `MCPE;...;` pong string to binary `ServerData` | gophertunnel's listener calls `PongData` every 4 s with a RakNet pong **string**, but a LAN `ResponsePacket` carries **binary** `ServerData`. Without conversion the world card is undecodable. Binary input is still passed through unchanged. |
+| `Listen()` allocates network IDs through a process-wide monotonic `atomic.Uint64` seed | `time.Now().UnixNano()` is coarse on Windows: two rapid `Listen()` calls (relay + loopback peer) could receive the **same** network ID, after which each peer discarded the other's packets as "our own broadcast" and `Signal()` could never route the answer back. `pong_test.go` pins 8 rapid instances to distinct IDs. |
+
+Measured 2026-11-05 with `cmd/xvrelay/nethernet_ingress_test.go` (two `lansignal.Signaling`
+instances on loopback, real WebRTC, no BDS / game client / Xbox service):
+
+| Step | Result |
+| --- | --- |
+| LAN discovery | bidirectional in ~2 s (each side records the other's UDP address) |
+| `CONNECTREQUEST` → `CONNECTRESPONSE` | delivered through `lansignal.Signal`; sender recorded from the `MessagePacket` alone |
+| ICE / DTLS / SCTP | `udp4 host` candidate pair selected, `starting SCTP transport` on both sides |
+| Minecraft Login + `StartGame` | `Accept()` yields `*minecraft.Conn`, `RemoteAddr().Network() == "nethernet"` |
+| Packet round trip | a `packet.Text` written on the server conn is read back on the client conn |
+| Stability | `-count=3` → 3/3 PASS, ~2 s per run |
+
+The loopback logs also confirm the pong fix: the client decodes the relay's `ResponsePacket` as
+`Minecraft Server` / `Gophertunnel`. `XVER_NNET_DEBUG=1` prints the full ICE/Login trace.
+
+One gophertunnel quirk is worth recording: `Dialer.DialContextNetwork(ctx, network, address)`
+reuses **one** string for both `Network.DialContext` (the NetherNet network ID) and
+`ClientData.ServerAddress`, which the listener validates as a resolvable UDP address. A decimal
+network ID fails that validation (`ServerAddress must be resolveable as a UDP address`). Real
+Bedrock clients send a real `IP:port` in `ServerAddress` and dial the network ID out of band, so
+only the loopback dialer needs the `fixedIDNetherNet` shim in the test.
+
+Honest boundaries: (1) this is a **loopback** with two synthetic signalling peers — a real
+Minecraft game client joining through the LAN list, and NetherNet ingress across two physical
+machines, are **not** verified. (2) `AllowAnonymous: true` means no `Xbox Live identity assertion`
+is enforced at the NetherNet layer; the Minecraft layer is `AuthenticationDisabled: true` too.
+(3) The **host-side** boundary is unchanged: a BDS with `transport=nethernet` still does not
+answer our outbound dial, which is why `-host-raknet` remains the measured workaround.
+(4) With `-listen-nethernet` combined with `-host-raknet`, the discovery socket binds UDP 7551
+and broadcasts `RequestPacket`s (it is muted/ephemeral in plain direct-host mode), so the relay
+is visible on the LAN.
 
 ### Semantic packet coverage (`PROTO-005`)
 
