@@ -123,10 +123,13 @@ go build -buildvcs=false -o dist/selfcheck ./cmd/selfcheck
 # CONN-002: join the relay the way a game client selects a LAN world — discover
 # its world card on UDP 7551, then dial that network ID over NetherNet/WebRTC.
 ./dist/selfcheck -lan-join -proto 2193 -soak 10s -json dist/selfcheck-lan-2193.json -v
+
+# exercise the C2H interaction path (place/click blocks, spawn eggs, hotbar):
+./dist/selfcheck -addr 127.0.0.1:19164 -proto 1001 -interactions -soak 8s -json dist/selfcheck-interactions.json -v
 ```
 
 Useful flags: `-proto` (`1001|2168|2169|2193`), `-reconnect N`, `-soak <duration>`,
-`-spawn-timeout`, `-json <path>`, `-v`. For `-lan-join`: `-lan-addr` (default
+`-spawn-timeout`, `-json <path>`, `-v`, `-interactions`. For `-lan-join`: `-lan-addr` (default
 `127.0.0.1:7551`), `-network-id` (skip discovery), `-lan-timeout`. `-lan-join` requires the
 relay to run with `-listen-nethernet`; `-addr` is ignored. It exits non-zero when any assertion
 fails, so it can be wired into CI. All four protocols have been live-tested against a BDS 1.26.33.1
@@ -362,6 +365,16 @@ Honest scope, because "it builds" and "it works" are different claims.
   Relay log after the two fixes below: **`level=ERROR` 0, `dropped 1 packet` 0,
   `non-offer signal` 0**, and `relay write end (destination closed)` 5 times instead of the
   previous WARN storm. See "Live LAN join and the two NetherNet fixes".
+- **Live GUI-client interaction translation (measured 2026-11-05):** a real Minecraft GUI client
+  (`ILwHee`, protocol `1001`, `1.26.32`) joined a `2193` LAN world through the relay on
+  `0.0.0.0:19164` and stayed 6 minutes. Its relay log exposed two silent C→H defects (hashed
+  `BlockRuntimeID` transactions dropped at read time, and 130-vs-131 `ActorFlags` bitsets rejected
+  at host write). Both are fixed at the root cause and covered by offline tests plus
+  `selfcheck -interactions`. Re-verified with the rebuilt binary: **8/8 sessions** (all four
+  protocols + `-reconnect 3`), `level=ERROR` **0**, `dropped 1 packet` **0**,
+  `bitset size mismatch` **0**, `client codec returned no packets` **0**, C→H tally `skipped=0`
+  with `InventoryTransaction=2` and `ClientMovementPredictionSync=3` per session. See
+  "GUI interaction translation (C2H)".
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, required/encrypted resource
@@ -387,9 +400,11 @@ index; the detailed numbers and boundaries live in the linked sections above.
 | #24 | NetherNet / WebRTC LAN ingress (`CONN-002`) | `b752d5d` / `42028122424` | full loopback: LAN discovery, `CONNECTREQUEST` → `CONNECTRESPONSE`, ICE/DTLS/SCTP, Login, `StartGame`, `Text` round trip; **3/3** runs at ~2 s each |
 | #26 | Census extractor covers all 8 H2C families + direction audit of the 10 codec families | `58691e0` / `42030933432` | `stacksFrom()` now handles **8/8 H2C** families; the other 2 are **C2H** and provably cannot reach a client. Re-measured 4 protocols `5118/5121/5120/5620`, `lost=0 unknown=0 ok=true`; `AddPlayer` / `MobArmourEquipment` never occur in the 1-player lab, so the wider extractor does not inflate the count |
 | #27 | Live two-machine LAN join with `selfcheck -lan-join` + two NetherNet fixes | `b0a3fe3` / `42037071018` | Real LAN world on another machine (`192.168.1.119:7551`, `My World`, proto `2193`): **13/13** sessions connected / dialled / spawned; `level=ERROR` **0** (was 8 `non-offer signal`), `dropped 1 packet` **0** (was 592), `relay write end (destination closed)` 5. `-reconnect 3` → 4/4 OK; sequential `1001`/`2168`/`2169` → 3/3 OK. Full `go test -race ./...` clean. Measured upstream constraint: the LAN host accepts only one active NetherNet connection at a time |
+| #28–#32 | GUI interaction translation (C2H): hashed `UseItem` IDs, no double-map, 130→131 prediction-sync bitset, `selfcheck -interactions` | `c36079c` / `42048437016` | Real GUI client log (`ILwHee`, `1001` → `2193`, 6 min): 13 `bitset size mismatch` drops → **0**. Re-verified **8/8** sessions (four protocols + `-reconnect 3`), `level=ERROR` **0**, `dropped 1 packet` **0**, `client codec returned no packets` **0**, every C→H tally `skipped=0` with `InventoryTransaction=2` + `ClientMovementPredictionSync=3` + 8 other families. Offline **33/33** codec×family no-drop cases + **3/3** hashed `MobEquipment` value checks. Full `go test -race ./...` clean (also fixed a real `*net.UDPAddr` data race in `TestNetherNetIngressLoopback`) |
 
 Only #19, the live parts of #21, #22 and #26 needed the BDS lab; #20, #23, #24 and the #21
-loopback harness are fully offline. CI runs `go build`, `go vet` and `go test ./...` (including all new
+loopback harness are fully offline. #27 and #28–#32 were measured against a real LAN world on
+another machine (NetherNet and RakNet ingress respectively), not the BDS lab. CI runs `go build`, `go vet` and `go test ./...` (including all new
 offline harnesses) but deliberately does **not** run benchmarks or the four opt-in tests gated by
 `XVER_MATRIX_REPORT` / `XVER_TERRAIN_CAPTURE` / captured payloads. A full
 `CGO_ENABLED=1 go test -race -buildvcs=false ./... -count=1` also passes locally on all six
@@ -402,6 +417,18 @@ packages (2026-11-05); race coverage is therefore not limited to the three targe
 - **The client must be signed into Xbox Live.** The vendored `2193` fork does not rescue an empty
   `DisplayName`, so an offline client is rejected at login with
   `DisplayName must not be empty`. A real Microsoft account is required on the client side.
+- **Real GUI game-client interaction is still user-side verification.** `cmd/selfcheck -interactions`
+  is headless: it sends the same 15 C→H packet families a GUI player uses (place/click blocks,
+  spawn eggs, hotbar, entity interact) and pins that none is dropped or mis-mapped, but it does not
+  render an inventory or move a real avatar. The 6-minute GUI session that exposed these defects
+  (`ILwHee`, `1001` → `2193`) is measured; a human re-test of every interaction in the real client
+  is the remaining manual step. See "GUI interaction translation (C2H)".
+- **Windows launch trap (measured, not a code bug):** `Start-Process -FilePath dist/xvrelay`
+  resolves to `dist/xvrelay.exe`. If an older `dist/xvrelay.exe` is left beside a freshly built
+  extensionless `dist/xvrelay`, the relay silently runs the stale binary and reproduces old bugs
+  (13 `bitset size mismatch` drops, missing `InventoryTransaction`). Build/overwrite **both**
+  names from the same source, or always pass the explicit `.exe` path, and verify with
+  `sha256sum` (both were `6194977…` after the fix).
 - **One active upstream connection per LAN world (measured, upstream constraint).** With
   `-listen-nethernet` the relay dials one NetherNet connection into the LAN world **per client
   session**. A real LAN world hosted by a game client accepts only one active connection at a
@@ -536,6 +563,8 @@ cmd/xvrelay/audit.go         re-parse client-bound chunks, check state IDs again
 cmd/xvrelay/host_recipes1001.go  recipe / creative-item / movement-bitset handling for 1001 hosts
 cmd/xvrelay/host_creative1001_test.go  pins host-1001 creative IDs -> native 2193 IDs
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
+cmd/xvrelay/block_translation.go  H2C palette translation + C2H interaction scrub / no-double-map / prediction-sync bitset resize
+cmd/xvrelay/block_translation_test.go  offline C2H regression tests: hashed UseItem IDs, wrapper unwrap, 33 codec x family no-drop cases
 cmd/xvrelay/bench_test.go        hot-path benchmarks (codec / item / chunk) + fixture validity test
 cmd/xvrelay/concurrency_test.go  8-session loopback concurrency / isolation / leak / race harness
 cmd/xvrelay/packs.go        CONN-005 pack policy + per-dial guard + host-Protocol sniff wrapper
@@ -544,7 +573,7 @@ cmd/xvrelay/semantic_coverage_test.go  PROTO-005 measured item/particle/NBT fami
 cmd/xvrelay/nethernet_ingress_test.go  CONN-002 full NetherNet/WebRTC ingress loopback (real ICE + Login + packet)
 cmd/xvrelay/relay_deadconn_test.go  connDead() classifies a closed NetherNet/WebRTC destination via its context
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
-cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report; -lan-join joins over NetherNet LAN discovery
+cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report; -lan-join joins over NetherNet LAN discovery; -interactions sends all 15 C2H gameplay families
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
 cmd/clientclone/items.go    live wire item census: extract all 8 H2C item-stack families, resolve IDs, ITEM_VISIBLE / ITEM_LOST / ITEM_UNKNOWN_ID
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
@@ -561,6 +590,11 @@ docs/                     protocol matrix, block-translation design notes, resea
 
 Pure Go — no CGO, no C compiler, no external services. `CGO_ENABLED=0` is set by the `Makefile` and
 matters on machines where a host gcc would otherwise be pulled in and fail on `sys/mman.h`.
+
+On Windows, keep `dist/xvrelay` and `dist/xvrelay.exe` (and the same pair for `selfcheck`) built
+from the **same** source: `Start-Process` / `CreateProcess` append `.exe` to an extensionless path,
+so a stale `dist/xvrelay.exe` will be executed instead of a freshly rebuilt `dist/xvrelay`. Verify
+with `sha256sum dist/xvrelay dist/xvrelay.exe` before restarting a live relay; see "Limitations".
 
 ```bash
 make build     # host binary -> dist/xvrelay
@@ -845,6 +879,54 @@ succeeded and 1 was disconnected after the **host** closed its SCTP transport
 one host connection per client session by design, so a single client — the intended manual-test
 scenario — is stable. Supporting several concurrent clients would require multiplexing all
 clients over one host connection, which is a larger architectural change.
+
+### GUI interaction translation (C2H)
+
+Measured 2026-11-05 from a **real Minecraft GUI client** log
+(`dist/log/xvrelay-2026-11-05_21-00-09.log`, `ILwHee`, protocol `1001` / `1.26.32`, host `2193`,
+6 minutes). `level=ERROR` was already 0, but the C→H tally had `skipped=13` and the log showed
+13 `dropped 1 packet` WARNs:
+
+```
+dir=C->H type=*packet.ClientMovementPredictionSync id=322
+error="panic while encoding *packet.ClientMovementPredictionSync: bitset size mismatch: expected 131, got 130"
+```
+
+That log also revealed the *invisible* defect: a packet dropped by the adapter at **read** time
+never appears in the relay tally at all, so "no ERROR" is not evidence that translations work.
+
+| Symptom ("place block / click block / spawn egg does nothing") | Root cause | Fix |
+| --- | --- | --- |
+| Every `UseItem` `InventoryTransaction` / `PlayerAuthInput.ItemInteractionData` vanishes | `UseBlockNetworkIDHashes=true` puts a 32-bit **StateHash** in `BlockRuntimeID`. `NewWithRegistries` assumes numeric runtime IDs, calls `blocks.TargetToNative(hash)`, misses, and `convertGameplayToLatest` returns an **empty slice** — gophertunnel silently drops the packet at read | `scrubInteractionBlocks()` zeroes hashed IDs and forces `ClickAir` while the adapter translates **item** IDs, then restores the original hash/`ActionType` verbatim on the converted packet. It runs on `unwrapWirePacket(pk)` because the 1001/2168/2169 wire pools return a `*translatedPacket` wrapper whose data lives in an unexported `inner` field |
+| Clicked/placed block turns into `minecraft:info_update` | The registry-aware client codec already mapped the IDs in `ConvertToLatest`; the C→H loop then ran `reverseBlocks.TranslateInteractions()` on those **native** IDs — a double map | `translateC2HInteractions()` skips the reverse mapper when `adapterHasRegistry(from.Proto().ID())`; wire-only codecs still use it |
+| Host rejects movement prediction (`expected 131, got 130`) | A `1001` client sends 130 `ActorFlags`; the native `2193` writer demands `protocol.EntityDataFlagCount` = 131. The relay dropped the packet, so the host rolled the player back | `resizeBitset(..., protocol.EntityDataFlagCount)` in `clientVersionProtocol.ConvertToLatest` (zero-pads the new flag); `host1001Protocol.ConvertFromLatest` does the inverse 131→130 for a `1001` host |
+
+`codecDropLogs` now warns (capped at 5) whenever a client codec returns no packets, so a future
+silent read-time drop is visible instead of being mistaken for "no errors".
+
+Offline coverage in `cmd/xvrelay/block_translation_test.go`: 7 targeted tests plus
+`TestClientCodecDoesNotDropOtherC2HFamilies` — **33/33** codec×family cases across
+`1001`/`2168`/`2169` (`ClientMovementPredictionSync`, `InventoryTransaction`,
+`PlayerAuthInput.ItemInteractionData`, `MobEquipment`, `ItemStackRequest`, `Interact`,
+`PlayerAction`, `Animate`, `SubChunkRequest`, `SetPlayerInventoryOptions`, `LevelEvent`) and
+**3/3** checks that a hashed `MobEquipment.NewItem.Stack.BlockRuntimeID` survives verbatim.
+
+Live harness: `cmd/selfcheck -interactions` sends 15 C→H packets per session (3 prediction sync,
+2 `UseItem` `ClickBlock` transactions with a real stone StateHash, 2
+`PlayerAuthInput.ItemInteractionData`, and 8 other families). Against the real LAN world with the
+rebuilt relay: **8/8 sessions** `OK=true` (four protocols + `-reconnect 3` → 4/4),
+`interactions_sent=true` in every JSON report, `level=ERROR` **0**, `dropped 1 packet` **0**,
+`bitset size mismatch` **0**, `client codec returned no packets` **0**, and every C→H tally has
+`skipped=0` with `ClientMovementPredictionSync=3 InventoryTransaction=2 PlayerAuthInput=2` plus
+the 8 other families. Only benign WARNs remain (`no host packs available to serve the client`,
+`dropping host custom blocks for a different-version client`).
+
+**Measurement trap (not a code bug):** on Windows, `Start-Process -FilePath dist/xvrelay`
+resolves to `dist/xvrelay.exe`, not the extensionless `dist/xvrelay`. A stale `dist/xvrelay.exe`
+from an earlier build produced a log that still showed the old `bitset size mismatch` drops and
+missing `InventoryTransaction`, which looked like a failed fix. Keep **both** filenames built from
+the same source (or always pass the explicit `.exe` path) before restarting the relay; the two
+binaries were verified identical with `sha256sum`.
 
 ### Semantic packet coverage (`PROTO-005`)
 
