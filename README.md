@@ -266,6 +266,13 @@ Honest scope, because "it builds" and "it works" are different claims.
   (`1001` shield 387, `2168`/`2169`/`2193` shield 358; all `spawned=true`, `decode_errors=0`).
   `cmd/xvrelay/item_registry_test.go` pins the shield IDs, the `+8` byte `BlockingTick` delta and
   the round-trip oracle. This is a headless codec-level client, not a rendering game client.
+- **Hot-path cost (offline microbenchmarks):** `make bench` measures `ns/op`, `B/op` and
+  `allocs/op` for codec conversion, item mapping and chunk translation across all four protocol
+  codecs. Measured 2026-11-05: a registry-aware 36-slot `InventoryContent` costs **2.4–2.8 µs**
+  (identity `2193` = **15 ns**), a full 2076-item `CreativeContent` once per spawn **~100 µs /
+  205 KB**, a ~2 KB sub-chunk rewrite **~1.2 µs / 5.5 KB**, and the per-session block mapper
+  build **~660 µs / 609 KB** — which is why it is cached behind `sync.Once`. This is
+  **per-operation cost, not process-level CPU or end-to-end latency**; see "Hot-path benchmarks".
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, resource packs, biomes, entity
@@ -350,8 +357,10 @@ Honest scope, because "it builds" and "it works" are different claims.
     live-verified (see "Live item census"), but biome schemas, entity metadata, block-entity NBT,
     particles and arbitrary add-on payload semantics are not re-mapped; those families are only
     counted by the self-check.
-  - `RELAY-001` — heap/goroutine samples exist; process-level CPU and latency percentiles are
-    explicitly **not measured** ("process-level CPU is not portable across platforms").
+  - `RELAY-001` — per-operation `ns/op` / `B/op` / `allocs/op` are now **measured** for the codec,
+    item-mapping and chunk-translation hot paths (see "Hot-path benchmarks"). Process-level CPU
+    and end-to-end latency percentiles are still **not measured**: that metric is not portable
+    across platforms, and a microbenchmark is not a substitute for a soak test.
   - `CONN-003` — the `ServerData` v5/v6/v7 parser is tested against malformed, truncated and
     trailing-byte payloads, but UDP discovery integration and stale-peer eviction are not.
   - The version→protocol table, block palette and item registry invariants, and the 16-pair wire
@@ -365,6 +374,7 @@ cmd/xvrelay/audit.go         re-parse client-bound chunks, check state IDs again
 cmd/xvrelay/host_recipes1001.go  recipe / creative-item / movement-bitset handling for 1001 hosts
 cmd/xvrelay/host_creative1001_test.go  pins host-1001 creative IDs -> native 2193 IDs
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
+cmd/xvrelay/bench_test.go        hot-path benchmarks (codec / item / chunk) + fixture validity test
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
@@ -385,6 +395,7 @@ matters on machines where a host gcc would otherwise be pulled in and fail on `s
 ```bash
 make build     # host binary -> dist/xvrelay
 make test      # go test ./...
+make bench     # hot-path benchmarks -> dist/bench.txt (ns/op, B/op, allocs/op)
 make vet
 make selfcheck # headless self-check client -> dist/selfcheck
 make itemaudit # offline invisible-item audit -> dist/itemaudit
@@ -421,6 +432,66 @@ A relative report path is resolved against the module root (not the package dire
 toolchain runs the test in) and its parent directory is created if missing, so this works in a fresh
 clone where `dist/` does not exist yet. The test **skips** when `XVER_MATRIX_REPORT` is unset, so a
 plain `go test ./...` does not run it — silence there is not a pass.
+
+### Hot-path benchmarks (`RELAY-001`)
+
+`cmd/xvrelay/bench_test.go` times the three paths the relay actually spends time on — codec
+conversion, item mapping and chunk translation — using the **real pinned registries** and **real
+packet shapes**, entirely offline (no BDS, no listener, no network). The codecs are the same
+adapters `resolveProto` / `registryAwareCodec` return, driven with a nil `*minecraft.Conn`, which is
+exactly the offline path `clientVersionProtocol` takes. `TestBenchFixtures` also runs under a plain
+`go test ./...`, so a fixture that stops parsing fails CI instead of silently producing a fast,
+meaningless benchmark.
+
+```bash
+make bench     # or, without make:
+CGO_ENABLED=0 go test -buildvcs=false ./cmd/xvrelay -run '^$' -bench . -benchmem -benchtime=200ms -count=3
+```
+
+Measured 2026-11-05: `windows/amd64`, Go 1.26.2, Intel Core i5-12450H, `CGO_ENABLED=0`,
+`-benchtime=200ms -count=3`. Values are the **median of the three runs**; raw output is written to
+`dist/bench.txt`. `ns/op` is one packet (or one operation), and `B/op` / `allocs/op` come from
+`-benchmem`. Fixture sizes: `InventoryContent` = 36 slots, `CreativeContent` = 2076 native entries,
+sub-chunk = v8 / 1 layer / 4 bits per block / 2048 packed bytes / 16-entry palette.
+
+| Path / case | ns/op | B/op | allocs/op |
+| --- | --- | --- | --- |
+| `InventoryContent` → `ConvertFromLatest` (H→C), `1001` registry | 2521 | 3416 | 6 |
+| `InventoryContent` → `ConvertFromLatest`, `2168` registry | 2785 | 3408 | 6 |
+| `InventoryContent` → `ConvertFromLatest`, `2169` registry | 2451 | 3392 | 5 |
+| `InventoryContent` → `ConvertFromLatest`, `1001` wire-only | 75 | 72 | 4 |
+| `InventoryContent` → `ConvertFromLatest`, `2169` wire-only | 54 | 48 | 3 |
+| `InventoryContent` → `ConvertFromLatest`, `2193` identity | 15 | 16 | 1 |
+| `InventoryContent` → `ConvertToLatest` (C→H), `1001` registry | 2433 | 3360 | 3 |
+| `InventoryContent` → `ConvertToLatest`, `2168` registry | 2419 | 3360 | 3 |
+| `InventoryContent` → `ConvertToLatest`, `2169` registry | 2422 | 3360 | 3 |
+| `InventoryContent` → `ConvertToLatest`, `1001` wire-only | 16 | 16 | 1 |
+| `InventoryContent` → `ConvertToLatest`, `2193` identity | 15 | 16 | 1 |
+| `CreativeContent` (2076 items) → `ConvertFromLatest`, `1001` registry | 100066 | 205032 | 7 |
+| `CreativeContent` → `ConvertFromLatest`, `2168` registry | 103307 | 205024 | 7 |
+| `CreativeContent` → `ConvertFromLatest`, `2169` registry | 103246 | 205008 | 6 |
+| `CreativeContent` → `ConvertFromLatest`, `2169` wire-only | 55 | 48 | 3 |
+| `CreativeContent` → `ConvertFromLatest`, `2193` identity | 15 | 16 | 1 |
+| `mapHostCreative1001` (host-1001 ID fix, 1933 entries) | 151279 | 407024 | 22 |
+| item index build (`2193`, 2076 entries) | 76913 | 218528 | 20 |
+| `blocktranslate.New(1001→2193)` — once per session | 659506 | 609048 | 149 |
+| `Mapper.Map` — single block ID lookup | 4.43 | 0 | 0 |
+| `LevelChunk` (inline v8 sub-chunk) translate | 1108 | 4864 | 7 |
+| `SubChunk` translate (+ v8→v9 upgrade) | 1215 | 5472 | 8 |
+| `UpdateBlock` translate | 33.86 | 40 | 2 |
+
+What the numbers mean: registry-aware conversion costs roughly **160–190×** the identity wire
+path (2.4–2.8 µs vs 15 ns), but is still well under 3 µs per 36-slot inventory packet. The
+expensive part of a spawn is the one-off full `CreativeContent` remap (~100 µs / 205 KB) and the
+`host1001Protocol` creative fix (~151 µs / 407 KB); both happen once, not per tick. The block
+mapper build (~660 µs / 609 KB) is likewise once per session, which is why `proto1001` /
+`proto2168` / `proto2169` cache it behind `sync.Once`; steady-state chunk translation is ~1.1–1.2 µs
+per 2 KB sub-chunk.
+
+Honest boundary: these are **microbenchmarks on synthetic-but-parseable payloads**, not process-level
+CPU profiling and not end-to-end latency percentiles. `RELAY-001` now has per-operation numbers
+instead of "not measured", but the process-level claim remains deliberately out of scope (it is not
+portable across platforms) and a soak test is still needed for tail latency.
 
 ### Terminal client clone (headless, command-driven)
 

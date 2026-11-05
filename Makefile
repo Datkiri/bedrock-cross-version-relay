@@ -2,6 +2,7 @@
 #
 #   make build     # host binary -> dist/xvrelay
 #   make test      # go test ./...
+#   make bench     # hot-path benchmarks -> dist/bench.txt (ns/op, B/op, allocs/op)
 #   make matrix    # 4x4 diagnostic report -> dist/matrix.json
 #   make selfcheck # headless self-check client -> dist/selfcheck
 #   make itemaudit # offline invisible-item audit -> dist/itemaudit
@@ -22,7 +23,7 @@ export GOFLAGS     := -buildvcs=false
 
 PLATFORMS := linux/amd64 linux/arm64 linux/arm windows/amd64 darwin/amd64 darwin/arm64
 
-.PHONY: all build test vet matrix selfcheck itemaudit clientclone release java java-check java-clean clean fmt
+.PHONY: all build test bench vet matrix selfcheck itemaudit clientclone release java java-check java-clean clean fmt
 
 all: build
 
@@ -32,6 +33,12 @@ build:
 
 test:
 	go test ./...
+
+# Hot-path benchmarks are opt-in (a plain `make test` never runs them). Three repetitions keep
+# the numbers from being a single noisy sample; dist/bench.txt is the reproducible artifact.
+bench:
+	@mkdir -p $(DIST)
+	@go test ./cmd/$(BIN) -run '^$$' -bench . -benchmem -benchtime=200ms -count=3 > $(DIST)/bench.txt 2>&1; status=$$?; cat $(DIST)/bench.txt; exit $$status
 
 vet:
 	go vet ./...
