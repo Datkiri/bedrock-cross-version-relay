@@ -350,6 +350,30 @@ Honest scope, because "it builds" and "it works" are different claims.
   only the narrow packed-ID cases named in "Semantic packet coverage" are rewritten. The tests
   prove the invariants they check; they do not promise full gameplay compatibility.
 
+## Verification ledger (2026-11-05)
+
+Each change below was pushed as its own commit. Every listed CI run is `completed/success` on all
+four jobs (`test (windows)` plus `build` on ubuntu/macos/windows). This table is the traceability
+index; the detailed numbers and boundaries live in the linked sections above.
+
+| Task | Change | Commit / CI | Key measurement |
+| --- | --- | --- | --- |
+| #19 | Live wire item census + host-1001 `CreativeContent` fix | `f903490` / `41968566411` | BDS 1.26.33.1, 4/4 protocols: `5122/5123/5123/5621` stacks decoded, `lost=0 unknown=0 ok=true` on all four; found and fixed 5 unmapped host-1001 creative IDs |
+| #20 | Hot-path benchmarks (`RELAY-001`) | `b9738da` / `41970545529` | `ns/op`, `B/op`, `allocs/op` for codec / item / chunk paths; `TestBenchFixtures` makes the fixtures fail CI if they ever stop parsing |
+| #21 | Concurrency / reconnect / soak (`CONN-004`) | `5e445b7` / `42014656107` | 8-session loopback isolation, `-reconnect 3` 4/4, 3 concurrent clients 3/3, 25 s soak, `-race` clean on the offline harness and the live relay |
+| #22 | Resource-pack prefetch + per-dial cost guard (`CONN-005`) | `7ba352d` / `42018501074` | host size lie `594 B declared` vs `734 B real`; prefetch 1 pack in `7.97 s`; budget abort in `35 ms` vs `report` with `overruns=1`; default skip downloads 0 |
+| #23 | Semantic packet coverage audit (`PROTO-005`) | `400932c` / `42022254603` | **10** item-stack families + `ItemRegistry` remapped; `CraftingData` keeps **8 of 11** recipe slices; 5 payload families forwarded unchanged; `ItemStackRequest/Response` carry **0** runtime IDs |
+| #24 | NetherNet / WebRTC LAN ingress (`CONN-002`) | `b752d5d` / `42028122424` | full loopback: LAN discovery, `CONNECTREQUEST` → `CONNECTRESPONSE`, ICE/DTLS/SCTP, Login, `StartGame`, `Text` round trip; **3/3** runs at ~2 s each |
+
+Only #19, the live parts of #21, and #22 needed the BDS lab; #20, #23, #24 and the #21 loopback
+harness are fully offline. CI runs `go build`, `go vet` and `go test ./...` (including all new
+offline harnesses) but deliberately does **not** run benchmarks or the four opt-in tests gated by
+`XVER_MATRIX_REPORT` / `XVER_TERRAIN_CAPTURE` / captured payloads. A full
+`CGO_ENABLED=1 go test -race -buildvcs=false ./... -count=1` also passes locally on all six
+packages (2026-11-05); race coverage is therefore not limited to the three targeted suites.
+`dist/` is ignored, so the repo carries no generated evidence files. The BDS lab is restored to
+`transport=nethernet` after every live test.
+
 ## Limitations
 
 - **The client must be signed into Xbox Live.** The vendored `2193` fork does not rescue an empty
