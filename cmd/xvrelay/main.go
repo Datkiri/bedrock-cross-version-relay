@@ -643,7 +643,31 @@ func (p clientVersionProtocol) ConvertToLatest(pk packet.Packet, conn *minecraft
 }
 
 // ConvertFromLatest is the heart of the translator.
-func (p clientVersionProtocol) ConvertFromLatest(pk packet.Packet, conn *minecraft.Conn) []packet.Packet {
+//
+// The deferred H→C hash guard fixes the LAST half of the "block placed/broken
+// renders wrong" symptom: the C→H half (hashed UseItem IDs silently dropped)
+// was fixed in ConvertToLatest, but the pinned adapters ALSO corrupt hashed
+// block IDs on the way OUT (UpdateBlock / LevelEvent / ItemStack.BlockRuntimeID).
+// See scrubHashedBlockIDs for the measurements.
+func (p clientVersionProtocol) ConvertFromLatest(pk packet.Packet, conn *minecraft.Conn) (out []packet.Packet) {
+	// conn == nil is the codec-only path (unit tests / verifyRoundTrip): there is
+	// no GameData to consult, so the protocol-independent hashed representation
+	// is assumed. In production conn is the client conn and gameData is the
+	// HOST's GameData (client.StartGame(serverConn.GameData())).
+	hashed := conn == nil || conn.GameData().UseBlockNetworkIDHashes
+	restore, scrubbed := scrubHashedBlockIDs(unwrapWirePacket(pk), hashed)
+	defer func() {
+		if !scrubbed {
+			return
+		}
+		// Verify/dump helpers call ConvertFromLatest and DISCARD the result, so
+		// undo the in-place scrub on the input too: otherwise the subsequent
+		// WritePacket would send zeros. Each restore call starts at index 0.
+		restore(unwrapWirePacket(pk))
+		for _, q := range out {
+			restore(unwrapWirePacket(q))
+		}
+	}()
 	if conn == nil {
 		return p.Protocol.ConvertFromLatest(pk, nil)
 	}
@@ -1454,9 +1478,12 @@ func relay(from, to *minecraft.Conn, dir string, trace int) {
 		}
 		if dir == "H->C" {
 			if value, ok := sessions.Load(to); ok {
-				// The 1001 adapter maps blocks itself for non-chunk packets when registries are
-				// enabled — skip to avoid double mapping.
-				if !noBlockTranslate && !adapterMapsBlocks(to.Proto().ID(), pk) {
+				// The pinned codecs map numeric block IDs themselves. With
+				// UseBlockNetworkIDHashes=true those IDs are protocol-independent
+				// StateHashes: blocktranslate must NOT touch them either (it would
+				// replace unknown pack hashes with the info_update placeholder).
+				// Only chunk payloads still need structural translation.
+				if !noBlockTranslate && !adapterMapsBlocks(to.Proto().ID(), pk, to.GameData().UseBlockNetworkIDHashes) {
 					translated, err := translateSessionPacket(value.(*session), pk)
 					if err != nil {
 						slog.Error("xvrelay: block translation failed; closing session", "packet", name, "error", err)
