@@ -27,9 +27,23 @@
 //
 // KNOWN LIMITS (read before judging any result):
 //   - Cross-version terrain uses internal/blocktranslate with pinned vanilla palettes.
-//     Unsupported known states use a visible placeholder. Item REGISTRIES are now pinned for all
-//     four protocol families, but item semantics inside gameplay packets (recipes, biome schemas,
-//     entity metadata, arbitrary addon/resource-pack content) remain separate concerns.
+//     Unsupported known states use a visible placeholder. Item REGISTRIES are pinned for all four
+//     protocol families, and the 1001/2168/2169 codecs (used on BOTH the client and host legs)
+//     are registry-aware BY DEFAULT
+//     (NewWithRegistries fed the native 2193 table), so item runtime IDs inside gameplay packets
+//     (InventoryContent / InventorySlot / MobEquipment / CraftingData / CreativeContent / ItemRegistry)
+//     are translated in BOTH directions. `-map-gameplay-items=false` restores the old plain New()
+//     codecs for A/B bisects. Measured: 259 item names have DIFFERENT 2193/2169 runtime IDs;
+//     apple 882->878, and the reverse path maps 878->882. Recipes / biome schemas / entity metadata /
+//     arbitrary addon/resource-pack content remain separate concerns.
+//   - Registry-aware codecs expect the NATIVE 2193 item table as input. Handing them the client's
+//     own table makes ValidateNativeEntries fail and the ItemRegistry packet is DROPPED.
+//     `clientItemRegistry()` implements that rule and `gameDataItemsFor()` MUST run for EVERY
+//     session, including same-wire ones — gating the replacement on clientProto != hostProto
+//     silently killed 1001 -> 1001 sessions (measured 2026-11-05, now fixed + regression test).
+//   - `-host-raknet` bypasses LAN discovery and dials the host directly over RakNet. It exists for
+//     a BDS with `transport=raknet`, where a NetherNet WebRTC dial never receives CONNECTRESPONSE.
+//     The client ingress is STILL RakNet-only (see README).
 //   - The fork in `third_party/gophertunnel-2193` does NOT carry the `rescueDisplayName` patch the
 //     bridge fork had, so the client must be signed into Xbox Live (must have a XUID). An offline
 //     client is rejected at Login with "DisplayName must not be empty".
@@ -39,6 +53,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -829,9 +844,9 @@ func resolveProto(id int32) (minecraft.Protocol, bool) {
 	case 1001:
 		return proto1001(), true
 	case 2168:
-		return v1_26_44.New(), true
+		return proto2168(), true
 	case 2169:
-		return v1_26_45.New(), true
+		return proto2169(), true
 	case 2193:
 		return minecraft.DefaultProtocol, true
 	}
@@ -845,7 +860,92 @@ var (
 	// blocks/items ITSELF (ConvertFromLatest/ToLatest). Our C→H mapper must then be disabled to
 	// avoid double mapping.
 	adapter1001HasRegistry bool
+
+	proto2168Once          sync.Once
+	proto2168Value         minecraft.Protocol
+	adapter2168HasRegistry bool
+
+	proto2169Once          sync.Once
+	proto2169Value         minecraft.Protocol
+	adapter2169HasRegistry bool
 )
+
+// registryAwareCodec builds a 2168/2169 adapter that knows BOTH the native 2193
+// block palette and the native 2193 item table. Without them the codec is a
+// pass-through and item runtime IDs inside gameplay packets stay at the host's
+// values. Measured offline (cmd/xvrelay/item_gameplay_test.go): with the native
+// table the mapper builds cleanly and none of the six item-carrying packet
+// families are dropped.
+func registryAwareCodec(id int32) (minecraft.Protocol, error) {
+	reg, err := blocktranslate.NativeRegistry(2193)
+	if err != nil {
+		return nil, fmt.Errorf("native 2193 block registry: %w", err)
+	}
+	items, err := blocktranslate.NativeItems()
+	if err != nil {
+		return nil, fmt.Errorf("native 2193 item registry: %w", err)
+	}
+	switch id {
+	case 2168:
+		return v1_26_44.NewWithRegistries(reg, items)
+	case 2169:
+		return v1_26_45.NewWithRegistries(reg, items)
+	}
+	return nil, fmt.Errorf("no registry-aware adapter for protocol %d", id)
+}
+
+// proto2168/proto2169 mirror proto1001: build the expensive mapper once, fall
+// back to the wire-only codec if anything fails. mapGameplayItems=false keeps
+// the historic behaviour for A/B bisects.
+func proto2168() minecraft.Protocol {
+	proto2168Once.Do(func() {
+		if !mapGameplayItems {
+			proto2168Value = v1_26_44.New()
+			return
+		}
+		p, err := registryAwareCodec(2168)
+		if err != nil {
+			slog.Warn("xvrelay: NewWithRegistries(2168) failed — using wire-only", "error", err)
+			proto2168Value = v1_26_44.New()
+			return
+		}
+		adapter2168HasRegistry = true
+		proto2168Value = p
+		slog.Info("xvrelay: 2168 adapter uses registries (item + block mapping)")
+	})
+	return proto2168Value
+}
+
+func proto2169() minecraft.Protocol {
+	proto2169Once.Do(func() {
+		if !mapGameplayItems {
+			proto2169Value = v1_26_45.New()
+			return
+		}
+		p, err := registryAwareCodec(2169)
+		if err != nil {
+			slog.Warn("xvrelay: NewWithRegistries(2169) failed — using wire-only", "error", err)
+			proto2169Value = v1_26_45.New()
+			return
+		}
+		adapter2169HasRegistry = true
+		proto2169Value = p
+		slog.Info("xvrelay: 2169 adapter uses registries (item + block mapping)")
+	})
+	return proto2169Value
+}
+
+func adapterHasRegistry(id int32) bool {
+	switch id {
+	case 1001:
+		return adapter1001HasRegistry
+	case 2168:
+		return adapter2168HasRegistry
+	case 2169:
+		return adapter2169HasRegistry
+	}
+	return false
+}
 
 // proto1001 returns the 1001 adapter WITH registries (item mapping + block mapping).
 //
@@ -886,27 +986,57 @@ func proto1001() minecraft.Protocol {
 //
 // The listener sends GameData.Items as an ItemRegistry packet through WritePacket, which runs the
 // client codec's ConvertFromLatest. There are two behaviours, and mixing them up is destructive:
-//   - registry-aware (NewWithRegistries, currently only 1001): the codec TRANSLATES the packet
-//     itself and expects the NATIVE (2193) table as input. Handing it the client's own table makes
-//     ValidateNativeEntries fail and the WHOLE ItemRegistry packet is dropped (return nil).
-//   - registry-less (plain New(), currently 2168/2169): ConvertFromLatest is a pass-through, so
+//   - registry-aware (NewWithRegistries: 1001 always, 2168/2169 when
+//     -map-gameplay-items is on): the codec TRANSLATES the packet itself and
+//     expects the NATIVE (2193) table as input. Handing it the client's own
+//     table makes ValidateNativeEntries fail and the WHOLE ItemRegistry packet
+//     is dropped (return nil).
+//   - registry-less (plain New()): ConvertFromLatest is a pass-through, so
 //     GameData.Items must already BE the client protocol's own table.
 //
 // Measured in internal/blocktranslate/items_test.go:TestItemRegistryMatchesCodec — the tables
 // returned by blocktranslate.Items are exactly what the registry-aware codecs emit, and
 // v1_26_45.New() passes all 2076 native entries through unchanged.
 func clientItemRegistry(clientProto int32) ([]protocol.ItemEntry, string, error) {
-	if clientProto == 1001 {
-		// Ensure the cached adapter has been built; sync.Once makes later calls free and also
-		// establishes the happens-before for reading adapter1001HasRegistry.
+	// Ensure the cached adapter has been built; sync.Once makes later calls free
+	// and also establishes the happens-before for reading the registry flags.
+	switch clientProto {
+	case 1001:
 		proto1001()
-		if adapter1001HasRegistry {
-			items, err := blocktranslate.NativeItems()
-			return items, "native 2193 (1001 codec translates it)", err
-		}
+	case 2168:
+		proto2168()
+	case 2169:
+		proto2169()
+	}
+	if adapterHasRegistry(clientProto) {
+		items, err := blocktranslate.NativeItems()
+		return items, fmt.Sprintf("native 2193 (%d codec translates it)", clientProto), err
 	}
 	items, err := blocktranslate.Items(clientProto)
 	return items, fmt.Sprintf("protocol %d (codec is pass-through)", clientProto), err
+}
+
+// gameDataItemsFor picks the ItemRegistry the listener will send for ONE session.
+//
+// ★ It MUST run for every session, INCLUDING same-wire ones. A registry-aware codec
+// (1001 always, 2168/2169 by default) drops any ItemRegistry that is not the native
+// 2193 table. Before 2026-11-05 the caller only replaced gd.Items when
+// clientProto != hostProto; a 1001 client into a 1001 host therefore inherited the
+// host's 1933-entry table and its ItemRegistry was silently dropped, so the client
+// never sent RequestChunkRadius / SetLocalPlayerAsInitialised. See
+// TestSameWireGameDataItemsNeverDropped in item_registry_test.go.
+//
+// keepHost=true is the -keepitems bisect escape hatch. The third return value says
+// whether a replacement happened (used only for the log line).
+func gameDataItemsFor(clientProto int32, hostItems []protocol.ItemEntry, keepHost bool) ([]protocol.ItemEntry, string, bool) {
+	if keepHost {
+		return hostItems, "host table (-keepitems)", false
+	}
+	items, source, err := clientItemRegistry(clientProto)
+	if err != nil {
+		return hostItems, fmt.Sprintf("host table (client registry unavailable: %v)", err), false
+	}
+	return items, source, true
 }
 
 // protocolForVersion maps a Minecraft version string → protocol id.
@@ -1937,6 +2067,13 @@ func dialHostWith(ctx context.Context, ls *lansignal.Signaling, id uint64, cd lo
 		"hostProto", protoID, "gameVersion", d.ClientData.GameVersion)
 	dctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if directHostAddr != "" {
+		// Plain RakNet host (BDS with transport=raknet). No WebRTC offer/answer,
+		// no LAN discovery signalling — the self-check harness uses this path.
+		slog.Info("xvrelay: dialling host over direct RakNet",
+			"addr", directHostAddr, "hostProto", protoID)
+		return d.DialContext(dctx, "raknet", directHostAddr)
+	}
 	return d.DialContextNetwork(dctx, minecraft.NetherNet{
 		Signaling: ls,
 		Dialer: nethernet.Dialer{
@@ -2101,18 +2238,26 @@ func handleConn(ctx context.Context, client *minecraft.Conn, ls *lansignal.Signa
 	// Which table to feed depends on whether the client codec translates ItemRegistry itself —
 	// see clientItemRegistry. This used to call Items(clientProto) unconditionally, which would
 	// make the registry-aware 1001 adapter drop the packet entirely.
-	if client.Proto().ID() != sess.hostProto && !keepHostItems {
-		items, source, ierr := clientItemRegistry(client.Proto().ID())
-		if ierr == nil {
-			gd.Items = items
-			slog.Info("xvrelay: ItemRegistry replaced",
-				"clientProto", client.Proto().ID(), "source", source,
-				"items", len(items), "hostItems", len(serverConn.GameData().Items))
-		} else {
-			slog.Warn("xvrelay: no item registry for the client — keeping the host's",
-				"clientProto", client.Proto().ID(), "error", ierr)
-		}
+	//
+	// ★ SAME-WIRE BUG (measured 2026-11-05): this replacement used to be gated on
+	// `clientProto != hostProto`. For a 1001 client into a 1001 host, gd.Items stayed
+	// at the host's 1933-entry table, but the 1001 codec IS registry-aware and
+	// ConvertFromLatest DROPS any ItemRegistry that is not the native 2193 table
+	// (asserted in item_registry_test.go: "1001 codec correctly drops a non-native
+	// ItemRegistry (0 packets)"). The client therefore received NO item table at all
+	// and never sent RequestChunkRadius/SetLocalPlayerAsInitialised. The gate is
+	// unnecessary: clientItemRegistry() already returns the client's OWN table for
+	// pass-through codecs (a no-op when host and client share a protocol) and the
+	// native table for registry-aware codecs. So run it unconditionally.
+	items, source, replaced := gameDataItemsFor(client.Proto().ID(), gd.Items, keepHostItems)
+	if replaced {
+		slog.Info("xvrelay: ItemRegistry replaced",
+			"clientProto", client.Proto().ID(), "source", source,
+			"items", len(items), "hostItems", len(serverConn.GameData().Items))
+	} else {
+		slog.Warn("xvrelay: keeping the host's ItemRegistry", "clientProto", client.Proto().ID(), "source", source)
 	}
+	gd.Items = items
 	if noItems {
 		gd.Items = nil
 		slog.Warn("xvrelay: -noitems ⇒ empty ItemRegistry (the listener sends its own, bypassing the relay)")
@@ -2401,6 +2546,47 @@ func probeHostProtoAtStartup(ctx context.Context, ls *lansignal.Signaling, id ui
 // It stays "dev" for a plain `go build`, which is the honest answer for a working tree.
 var buildVersion = "dev"
 
+// directHostAddr is set by -host-raknet. When non-empty the relay skips LAN
+// discovery entirely and dials the host over plain RakNet. That is what makes a
+// dedicated server (BDS with transport=raknet) usable as a complete host for the
+// offline self-check harness: no player-hosted NetherNet world and no Xbox Live
+// session are needed.
+var directHostAddr string
+
+// mapGameplayItems controls whether the 2168/2169 codecs are built with
+// NewWithRegistries. Registry-aware codecs translate item runtime IDs inside
+// gameplay packets (InventoryContent, InventorySlot, MobEquipment, CraftingData,
+// CreativeContent, ...) in BOTH directions. Plain New() passes those IDs
+// straight through, so a 2168/2169 host leaves host IDs in the canonical 2193
+// packets. It is opt-in because enabling it also changes ~20 packet families
+// (block runtime IDs in UpdateBlock, transactions, PlayerAuthInput, ...).
+var mapGameplayItems = true
+
+// directWorld builds the synthetic World used in -host-raknet mode. The
+// NetworkID is a stable hash of the address so the on-disk protocol cache does
+// not collide with real LAN worlds. Version 5 mirrors the BDS ServerData v5 we
+// measured (47 bytes, no nonce), so usableWorld() accepts it without a nonce.
+func directWorld(addr string) lansignal.World {
+	sum := md5.Sum([]byte(addr))
+	id := binary.BigEndian.Uint64(sum[:8])
+	if id == 0 {
+		id = 1
+	}
+	uaddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		slog.Warn("xvrelay: cannot resolve -host-raknet address", "addr", addr, "error", err)
+	}
+	return lansignal.World{
+		NetworkID: id,
+		Addr:      uaddr,
+		Host: &lansignal.HostInfo{
+			Version:    5,
+			ServerName: "Direct RakNet host",
+			LevelName:  "Direct RakNet host",
+		},
+	}
+}
+
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:19164", "address to listen on for clients")
 	world := flag.String("world", "", "LAN world: level/host NAME (stable across re-opens) or NetworkID (empty = the only world found)")
@@ -2410,6 +2596,10 @@ func main() {
 		"client protocols to accept: auto = all (1001,2168,2169,2193) | list, e.g. 1001,2169")
 	hostProto := flag.String("host-proto", "auto",
 		"LAN world protocol: auto (read from LAN discovery) | 2193=1.26.51 | 2169=1.26.45 | 2168=1.26.44 | 1001=1.26.30-36")
+	directHost := flag.String("host-raknet", "",
+		"dial the host directly over RakNet (host:port) instead of NetherNet/LAN discovery; for a BDS with transport=raknet and the self-check harness")
+	flag.BoolVar(&mapGameplayItems, "map-gameplay-items", true,
+		"build the 2168/2169 codecs with NewWithRegistries so item IDs inside gameplay packets are translated (disable with -map-gameplay-items=false for bisect)")
 	flag.StringVar(&startGameMode, "startgame", "raw", "raw (replay host bytes verbatim when the wire matches) | rebuild")
 	flag.StringVar(&dimDataMode, "dimdata", "auto", "DimensionData: auto/off (keep the host's data) | force (diagnostic: inject a synthetic table)")
 	flag.StringVar(&identityMode, "identity", "auto", "identity sent to the host: auto (the client's real name + XUID) | bot (the host sees Steve)")
@@ -2437,6 +2627,7 @@ func main() {
 	decodeFile := flag.String("decodefile", "", "decode a StartGame payload from a file, print its fields, exit")
 	versionFlag := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
+	directHostAddr = *directHost
 
 	if *versionFlag {
 		fmt.Printf("xvrelay %s\n", buildVersion)
@@ -2536,24 +2727,43 @@ func main() {
 	// every time.
 	var ls *lansignal.Signaling
 	var w lansignal.World
-	for attempt := 1; ; attempt++ {
+	if directHostAddr != "" {
+		// Still create a Signaling object: dialHostWith -> worldByID asks it for
+		// Worlds(), and the remembered synthetic world in lastWorlds is returned
+		// from there. NoBroadcast keeps us off UDP 7551 so a real LAN host is not
+		// disturbed.
 		var err error
-		ls, err = discoverWorlds(ctx, *timeout)
-		if err == nil {
-			w, err = pickWorld(ls, *world)
-			if err == nil {
-				break
-			}
-			slog.Warn("xvrelay: no world selected yet — retrying", "attempt", attempt,
-				"error", err, "peers", ls.Peers())
-			ls.Close()
-		} else {
-			slog.Warn("xvrelay: no LAN world yet — retrying", "attempt", attempt, "error", err)
+		ls, err = lansignal.Listen(lansignal.Options{
+			Addr: "0.0.0.0:0", NoBroadcast: true, Log: slog.Default(),
+		})
+		if err != nil {
+			slog.Error("xvrelay: direct discovery socket failed", "error", err)
+			os.Exit(1)
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(3 * time.Second):
+		w = directWorld(directHostAddr)
+		rememberWorld(w)
+		slog.Info("xvrelay: direct RakNet host mode — LAN discovery skipped",
+			"addr", directHostAddr, "network_id", w.NetworkID)
+	} else {
+		for attempt := 1; ; attempt++ {
+			var err error
+			ls, err = discoverWorlds(ctx, *timeout)
+			if err == nil {
+				w, err = pickWorld(ls, *world)
+				if err == nil {
+					break
+				}
+				slog.Warn("xvrelay: no world selected yet — retrying", "attempt", attempt,
+					"error", err, "peers", ls.Peers())
+				ls.Close()
+			} else {
+				slog.Warn("xvrelay: no LAN world yet — retrying", "attempt", attempt, "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
 		}
 	}
 	defer ls.Close()
@@ -2759,11 +2969,15 @@ func main() {
 			continue
 		}
 		go func(conn *minecraft.Conn) {
-			current, err := pickWorld(ls, *world)
-			if err != nil {
-				slog.Error("xvrelay: selecting the current world failed", "error", err)
-				_ = conn.Close()
-				return
+			current := w
+			if directHostAddr == "" {
+				var err error
+				current, err = pickWorld(ls, *world)
+				if err != nil {
+					slog.Error("xvrelay: selecting the current world failed", "error", err)
+					_ = conn.Close()
+					return
+				}
 			}
 			slog.Info("xvrelay: world selected for incoming client", "network_id", current.NetworkID, "level", current.Host.LevelName, "host", current.Host.ServerName)
 			if err := handleConn(ctx, conn, ls, current.NetworkID, *trace); err != nil {

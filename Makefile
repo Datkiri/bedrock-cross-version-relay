@@ -3,6 +3,7 @@
 #   make build     # host binary -> dist/xvrelay
 #   make test      # go test ./...
 #   make matrix    # 4x4 diagnostic report -> dist/matrix.json
+#   make selfcheck # headless self-check client -> dist/selfcheck
 #   make release   # all six platform binaries -> dist/
 #   make java      # Java translation core -> java/out, java/out-tools
 #   make java-check  # compile the Java tree and run its probes
@@ -19,7 +20,7 @@ export GOFLAGS     := -buildvcs=false
 
 PLATFORMS := linux/amd64 linux/arm64 linux/arm windows/amd64 darwin/amd64 darwin/arm64
 
-.PHONY: all build test vet matrix release java java-check java-clean clean fmt
+.PHONY: all build test vet matrix selfcheck release java java-check java-clean clean fmt
 
 all: build
 
@@ -36,10 +37,15 @@ vet:
 fmt:
 	gofmt -l -w cmd internal
 
-# Opt-in diagnostic: 16 protocol pairs x 7 checks. Findings are to-do items, not crashes.
+# Opt-in diagnostic: 16 protocol pairs x 8 checks. Findings are to-do items, not crashes.
 matrix:
 	@mkdir -p $(DIST)
 	XVER_MATRIX_REPORT=$(DIST)/matrix.json go test ./cmd/$(BIN) -run TestProtocolCompatibilityMatrix -v
+
+# Independent headless Bedrock client used for live self-checks against a running relay.
+selfcheck:
+	@mkdir -p $(DIST)
+	go build -trimpath -o $(DIST)/selfcheck ./cmd/selfcheck
 
 release:
 	@mkdir -p $(DIST)

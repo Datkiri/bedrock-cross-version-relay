@@ -98,10 +98,27 @@ Then, with the world already open to LAN:
 
 # force protocols instead of detecting them
 ./dist/xvrelay -client-proto 2193 -host-proto 1001
+
+# BDS / direct-host lab: skip LAN discovery, dial the server over RakNet
+# (requires server.properties: transport=raknet)
+./dist/xvrelay -host-raknet 127.0.0.1:19132 -host-proto 1001 -client-proto auto -listen 127.0.0.1:19164
 ```
 
 Point the older/newer client at `<relay-ip>:19164` using **Add Server**. The relay logs both
 directions; `-trace 40` (default) prints the first 40 packet names per direction, `-trace 0` silences it.
+
+For an automated check without a game client, `cmd/selfcheck` is a headless Bedrock client that
+spawns through the relay and reports assertions as JSON:
+
+```bash
+go build -buildvcs=false -o dist/selfcheck ./cmd/selfcheck
+./dist/selfcheck -addr 127.0.0.1:19164 -proto 2193 -soak 10s -json dist/selfcheck-2193.json -v
+```
+
+Useful flags: `-proto` (`1001|2168|2169|2193`), `-reconnect N`, `-soak <duration>`,
+`-spawn-timeout`, `-json <path>`, `-v`. It exits non-zero when any assertion fails, so it can be
+wired into CI. All four protocols have been live-tested against a BDS 1.26.33.1 host; see
+[What is actually verified](#what-is-actually-verified).
 
 Multiple clients of *different* versions can be relayed into the same host at once — spawn capture and
 the spawn-prefix gate are per-session, keyed by connection.
@@ -140,10 +157,19 @@ the spawn-prefix gate are per-session, keyed by connection.
   `v1_26_44.NewWithRegistries` delegates to `v1_26_45`. A test asserts each table is byte-for-byte
   the name/ID mapping its registry-aware codec emits.
 - Which table goes into `GameData.Items` depends on the client codec. A **registry-aware** codec
-  (currently `1001`) translates `ItemRegistry` itself and expects the **native `2193`** table as
-  input — feeding it the client's own table makes validation fail and the packet is dropped. A
-  **registry-less** codec (`2168`/`2169` use plain `New()`) passes it through, so it must be handed
-  the client's own table. `clientItemRegistry()` implements that rule; both branches are tested.
+  (`1001`, `2168` and `2169` by default — all built with `NewWithRegistries`) translates
+  `ItemRegistry` itself and expects the **native `2193`** table as input — feeding it the client's
+  own table makes `ValidateNativeEntries` fail and the packet is dropped. A **registry-less** codec
+  (the `2168`/`2169` plain `New()` fallback behind `-map-gameplay-items=false`, and the native
+  `2193` default protocol) passes it through, so it must be handed the client's own table.
+  `clientItemRegistry()` implements that rule; both branches are tested in `item_registry_test.go`
+  and `item_gameplay_test.go`.
+- The registry-aware codecs also translate item runtime IDs **inside gameplay packets**, in both
+  directions, not just the advertised registry. Measured offline: 259 item names carry different
+  `2193`/`2169` IDs (1717 are identical), `minecraft:apple` maps `882 → 878` and back `878 → 882`,
+  `plain New()` leaves `882` untouched, and all six item-carrying packet families survive
+  `ConvertFromLatest` (`out=1`). An unknown runtime ID is not dropped but replaced by AIR
+  (`hideUnknown=true`). Disable with `-map-gameplay-items=false` to reproduce the old behaviour.
 - `SubChunk` v8 → v9 is upgraded when the target is `2193` (the Y byte after the storage count is new
   in v9); downgrades keep the remaining LevelChunk tail bytes intact.
 
@@ -163,6 +189,8 @@ codec.
 | `-timeout` | `20s` | LAN discovery window |
 | `-client-proto` | `auto` | force the client-side protocol (`1001`/`2168`/`2169`/`2193`) |
 | `-host-proto` | `auto` | force the host-side protocol |
+| `-host-raknet` | *(off)* | dial the host directly over RakNet (`host:port`), skipping LAN discovery — for a BDS with `transport=raknet` and the self-check harness |
+| `-map-gameplay-items` | `true` | build the `2168`/`2169` codecs with `NewWithRegistries` so item IDs inside gameplay packets are translated; `false` restores plain `New()` for bisect |
 | `-trace` | `40` | print the first N packet names per direction, `0` = off |
 | `-dial-timeout` | `60s` | max time to dial the host, resource-pack download included |
 | `-startgame` | `raw` | `raw` = replay the host's original bytes when the wire matches, `rebuild` = re-encode |
@@ -193,6 +221,20 @@ Honest scope, because "it builds" and "it works" are different claims.
   are checked for unique names/IDs and for matching the registry-aware codecs' output; the
   pass-through codec case and the non-native-input drop are both asserted in
   `cmd/xvrelay/item_registry_test.go`.
+- **Gameplay item level (offline):** `cmd/xvrelay/item_gameplay_test.go` asserts bidirectional
+  runtime-ID translation for `1001`/`2168`/`2169`, six canonical item-carrying packet families are
+  not dropped, plain `New()` is a pass-through control, unknown IDs become AIR, and `resolveProto()`
+  really returns a registry-aware adapter. Measured: 259 differing IDs / 1717 identical IDs among
+  the 1976 shared names; 2076 native entries → 1976 emitted.
+- **Live self-check (headless):** `cmd/selfcheck` is an independent terminal Bedrock client. It
+  dials the relay's RakNet listener, spawns, counts 18 packet families, checks `GameData().Items`
+  against the expected table, samples heap/goroutines, supports `-reconnect` and `-soak`, writes a
+  JSON report and exits non-zero on a failed assertion. Against a real BDS 1.26.33.1 host
+  (`transport=raknet`, reached with `-host-raknet 127.0.0.1:19132 -host-proto 1001`) the final
+  uniform run on the fixed binary (`-client-proto auto`, `-soak 4s`) gave all four protocols
+  spawning with 921 LevelChunks, `registry=true`, `soak_complete`, `OK=true`, exit 0:
+  `1001` 1239 packets / `items=1933`, `2168` 1217 / 1976, `2169` 1304 / 1976,
+  `2193` 1654 / 2076. That is four live client→relay→BDS paths, still not all 16 protocol pairs.
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, resource packs, biomes, entity
@@ -204,20 +246,37 @@ Honest scope, because "it builds" and "it works" are different claims.
 - **The client must be signed into Xbox Live.** The vendored `2193` fork does not rescue an empty
   `DisplayName`, so an offline client is rejected at login with
   `DisplayName must not be empty`. A real Microsoft account is required on the client side.
-- **Terrain, block updates, clicked-block IDs and the advertised item registry** are translated.
+- **Same-wire sessions were broken until 2026-11-05 — now fixed.** A `1001` client into a `1001`
+  BDS host used to log `dial world OK hostProto=1001 clientProto=1001` and then go silent for ~41 s
+  before disconnecting itself (`StartGame to the client failed ... context canceled`,
+  `clientID113=false`). Root cause: `GameData.Items` was only replaced when the client and host
+  protocols **differed**, so a same-wire `1001` client inherited the host's 1933-entry table — but
+  the `1001` codec is registry-aware and `ConvertFromLatest` **silently drops** any `ItemRegistry`
+  that is not the native 2193 table. The client received no item table and never sent
+  `RequestChunkRadius` / `SetLocalPlayerAsInitialised`. `-verify` was ruled out (the failure also
+  occurred without it), and a direct BDS dial spawned fine, so the wire was never the problem.
+  The fix runs `gameDataItemsFor()` for **every** session; `TestSameWireGameDataItemsNeverDropped`
+  pins the invariant. Live re-test with the fixed binary: `ItemRegistry replaced ...
+  items=2076 hostItems=1933` → `client sent id=69` → `★ client has spawned into the world`,
+  921 LevelChunks, `registry=true`, exit 0.
+- **Terrain, block updates, clicked-block IDs, the advertised item registry and item IDs inside
+  gameplay packets** are translated for all four client protocols (`1001`/`2168`/`2169`/`2193`).
   Recipes, biome schemas, entity metadata, block-entity NBT, particles and arbitrary add-on content
-  are separate problems and are **not** solved here.
-- **Item IDs inside gameplay packets are only mapped when the host codec is registry-aware.** The
-  relay advertises the correct item table to every client, but `2168`/`2169` hosts use the plain
-  `v1_26_45.New()` codec (no item mapper), so an `InventoryContent` packet from such a host keeps
-  the host's IDs. Measured: `v1_26_45.New().ConvertFromLatest` passes an `ItemRegistry` of 2076
-  native entries through unchanged, while `NewWithRegistries` emits 1976. Turning those codecs into
-  registry-aware ones would fix this, but it changes many gameplay packets at once and needs a real
-  client to validate — it is deliberately left as the next step.
+  are separate problems and are **not** solved here. The relay counts these packet families in the
+  live self-check but does not re-map their payloads.
+- **The gameplay item fix is offline-verified, not client-verified.** `2168`/`2169` previously used
+  plain `v1_26_45.New()` codecs with no item mapper, so an `InventoryContent` packet kept the host's
+  IDs. They now default to `NewWithRegistries` fed the native `2193` table; a plain codec passes a
+  2076-entry `ItemRegistry` through unchanged while the registry-aware one emits 1976. The mapping
+  is asserted offline in `item_gameplay_test.go` (both directions, six packet families, no drops,
+  non-native input dropped). What has **not** been done is a real Bedrock client visually confirming
+  an inventory item; `-map-gameplay-items=false` exists to bisect that if it ever regresses. An
+  unknown runtime ID is replaced by AIR (`hideUnknown=true`) rather than dropped.
 - **Ingress is RakNet only.** Clients reach the relay over RakNet; NetherNet is used for LAN discovery
-  (UDP 7551) and for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`). A client
-  that can only speak NetherNet — for example one joining through an activity handle instead of the
-  LAN list — cannot connect. This is a design boundary, not a bug.
+  (UDP 7551) and, by default, for dialling the host (`DialContextNetwork(... minecraft.NetherNet{...})`).
+  `-host-raknet` replaces that host leg with a plain RakNet dial for a BDS configured with
+  `transport=raknet`. A client that can only speak NetherNet — for example one joining through an
+  activity handle instead of the LAN list — cannot connect. This is a design boundary, not a bug.
 - **Resource-pack prefetch is disabled** (`if false` before `prefetchHostPacks`): hosts were observed
   misreporting pack sizes, which made the download hang. Packs are still served to the client from the
   most recent host dial; only the pre-dial is off.
@@ -227,13 +286,25 @@ Honest scope, because "it builds" and "it works" are different claims.
   contents. Snapshots are pinned per protocol, and previews/future builds are unsupported until
   re-pinned.
 - **This is a LAN-world relay.** Realms, cloud sessions, NAT traversal and matchmaking are out of scope.
-- **Not yet covered by tests or a real client** (2026-11-05): multi-transport/NetherNet ingress
-  (CONN-002), UDP discovery integration and stale-peer eviction (CONN-003), live multi-client
-  soak/reconnect (CONN-004), resource-pack negotiation edge cases (CONN-005), and any CPU/RAM/
-  latency benchmark (RELAY-001). What **is** covered offline: the `ServerData` v5/v6/v7 parser
-  against malformed, truncated and trailing-byte payloads; the version→protocol table including
-  unknown/mismatched hosts; the block palette and item registry invariants; and the 16-pair wire
-  matrix. Do not read a missing row here as "verified".
+- **Partially measured, still open** (2026-11-05):
+  - `CONN-002` — NetherNet ingress is still not implemented (clients use RakNet only). A BDS with
+    `transport=nethernet` advertises `ServerData v5` (47-byte payload, `TransportLayer=2`,
+    `ConnectionType=4`) but a direct `go-nethernet` dial sent `CONNECTREQUEST` and received **no**
+    `CONNECTRESPONSE` (25 s `context deadline exceeded`). `-host-raknet` is the measured workaround,
+    not a NetherNet implementation.
+  - `CONN-004` — the self-check harness supports `-reconnect N` and `-soak <duration>`; a
+    multi-client, hours-long soak has **not** been run.
+  - `CONN-005` — pack prefetch stays off; the self-check observed `ResourcePackStack/DataInfo/
+    ChunkData = 0/0/0` on a pack-free BDS, so the pack edge cases are untested.
+  - `PROTO-005` — biome / actor-identifier / crafting / creative / inventory / block-entity packet
+    families are **counted** by the self-check (each `=1` in the live runs) but their payloads are
+    not semantically re-mapped.
+  - `RELAY-001` — heap/goroutine samples exist; process-level CPU and latency percentiles are
+    explicitly **not measured** ("process-level CPU is not portable across platforms").
+  - `CONN-003` — the `ServerData` v5/v6/v7 parser is tested against malformed, truncated and
+    trailing-byte payloads, but UDP discovery integration and stale-peer eviction are not.
+  - The version→protocol table, block palette and item registry invariants, and the 16-pair wire
+    matrix are covered offline. Do not read a missing row here as "verified".
 
 ## Layout
 
@@ -241,6 +312,8 @@ Honest scope, because "it builds" and "it works" are different claims.
 cmd/xvrelay/                 the relay: listener, dialer, spawn gate, translation wiring, bisect flags
 cmd/xvrelay/audit.go         re-parse client-bound chunks, check state IDs against the target registry
 cmd/xvrelay/host_recipes1001.go  recipe / movement-bitset handling for 1001 hosts
+cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
+cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
 internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address)
 internal/mcport/          Minecraft port detection helpers
@@ -258,6 +331,7 @@ matters on machines where a host gcc would otherwise be pulled in and fail on `s
 make build     # host binary -> dist/xvrelay
 make test      # go test ./...
 make vet
+make selfcheck # headless self-check client -> dist/selfcheck
 make release   # linux/amd64, linux/arm64, linux/arm, windows/amd64, darwin/amd64, darwin/arm64
 ```
 
@@ -291,13 +365,16 @@ toolchain runs the test in) and its parent directory is created if missing, so t
 clone where `dist/` does not exist yet. The test **skips** when `XVER_MATRIX_REPORT` is unset, so a
 plain `go test ./...` does not run it — silence there is not a pass.
 
-Measured baseline (2026-11-05, CGO disabled): `go build ./...`, `go vet ./...`, `go test ./...`
-all pass; all six release targets cross-compile (`linux amd64/arm64/arm`, `windows amd64`,
-`darwin amd64/arm64`); `go test -race ./cmd/xvrelay ./internal/blocktranslate` passes with CGO
-enabled. Four tests are opt-in and skip by default: `TestProtocolCompatibilityMatrix`
-(`XVER_MATRIX_REPORT`), `TestCapturedSubChunkPreservesBlockEntities` (`XVER_TERRAIN_CAPTURE`),
-and the two dump-dependent tests in `internal/blocktranslate` (they need a captured host payload).
-A green CI run is therefore **not** a claim about those four paths.
+Measured baseline (2026-11-05, CGO disabled): `go build -buildvcs=false ./...`,
+`go vet ./...`, `go test -buildvcs=false ./...` all pass, including `cmd/selfcheck` and the five
+`item_gameplay_test.go` assertions; all six release targets cross-compile
+(`linux amd64/arm64/arm`, `windows amd64`, `darwin amd64/arm64`);
+`go test -race ./cmd/xvrelay ./internal/blocktranslate` passes with CGO enabled. Four tests are
+opt-in and skip by default: `TestProtocolCompatibilityMatrix` (`XVER_MATRIX_REPORT`),
+`TestCapturedSubChunkPreservesBlockEntities` (`XVER_TERRAIN_CAPTURE`), and the two dump-dependent
+tests in `internal/blocktranslate` (they need a captured host payload). A green CI run is therefore
+**not** a claim about those four paths. The live `cmd/selfcheck` matrix is a separate process and
+is **not** part of `go test ./...`.
 
 ### Platform status
 

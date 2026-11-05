@@ -1,0 +1,554 @@
+// Command selfcheck is a headless terminal Bedrock client used to independently
+// exercise a running xvrelay RakNet listener. It connects with a selectable
+// client protocol, spawns, counts gameplay packets and writes a JSON report.
+//
+// It deliberately does not talk to the real game, Xbox Live or any GUI: it is
+// the independent client used in place of a game client for live measurements.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"text/tabwriter"
+	"time"
+
+	"bedrock-cross-version-relay/internal/blocktranslate"
+
+	"github.com/google/uuid"
+	"github.com/sandertv/gophertunnel/minecraft"
+	"github.com/sandertv/gophertunnel/minecraft/protocol"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
+	v1_26_30 "github.com/shawtymarco/go-multiversion/protocols/v1_26_30"
+	v1_26_44 "github.com/shawtymarco/go-multiversion/protocols/v1_26_44"
+	v1_26_45 "github.com/shawtymarco/go-multiversion/protocols/v1_26_45"
+)
+
+// defaultDrainWindow is how long a session keeps reading packets when -soak is
+// not set. Spawn-time packets (StartGame, registries, chunks) arrive over the
+// first seconds after DoSpawn, so a bounded drain is needed to observe them.
+const defaultDrainWindow = 3 * time.Second
+
+// readDeadlineSlice bounds each individual ReadPacket call. A short slice keeps
+// the reader goroutine responsive to the session's stop time and guarantees the
+// harness never hangs on an idle or half-closed connection.
+const readDeadlineSlice = 200 * time.Millisecond
+
+// cpuNote is recorded verbatim in every report: process-level CPU usage cannot
+// be sampled portably across platforms, so no CPU number is invented.
+const cpuNote = "not measured: process-level CPU is not portable across platforms"
+
+type config struct {
+	addr         string
+	proto        int32
+	spawnTimeout time.Duration
+	soak         time.Duration
+	reconnect    int
+	jsonPath     string
+	verbose      bool
+}
+
+var verbose bool
+
+func vlog(format string, args ...any) {
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[selfcheck] "+format+"\n", args...)
+	}
+}
+
+type itemSample struct {
+	Name      string `json:"name"`
+	RuntimeID int16  `json:"runtime_id"`
+}
+
+type heapSample struct {
+	OffsetMS       int64  `json:"offset_ms"`
+	HeapAllocBytes uint64 `json:"heap_alloc_bytes"`
+	NumGoroutine   int    `json:"num_goroutine"`
+}
+
+type assertion struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type session struct {
+	Proto             int32             `json:"proto"`
+	Addr              string            `json:"addr"`
+	Timestamp         string            `json:"timestamp"`
+	SpawnMS           int64             `json:"spawn_ms"`
+	LifetimeMS        int64             `json:"lifetime_ms"`
+	PacketsTotal      uint64            `json:"packets_total"`
+	Packets           map[string]uint64 `json:"packets"`
+	GameDataItems     int               `json:"game_data_items"`
+	Items             []itemSample      `json:"items"`
+	ItemRegistryMatch bool              `json:"item_registry_match"`
+	Chunks            uint64            `json:"chunks"`
+	SubChunks         uint64            `json:"subchunks"`
+	DisconnectReason  string            `json:"disconnect_reason"`
+	HeapAllocBytes    uint64            `json:"heap_alloc_bytes"`
+	NumGoroutine      int               `json:"num_goroutine"`
+	HeapSamples       []heapSample      `json:"heap_samples,omitempty"`
+	CPU               string            `json:"cpu"`
+	Assertions        []assertion       `json:"assertions"`
+	OK                bool              `json:"ok"`
+	Error             string            `json:"error,omitempty"`
+}
+
+// trackedPacket ties a human-readable counter name to the uint32 packet ID
+// reported by Conn.ReadPacket(). The go-multiversion codecs expose their pools
+// under the same latest packet.ID* constants, so one table covers all protocols.
+type trackedPacket struct {
+	name string
+	id   uint32
+}
+
+var trackedPackets = []trackedPacket{
+	{"LevelChunk", packet.IDLevelChunk},
+	{"SubChunk", packet.IDSubChunk},
+	{"SubChunkRequest", packet.IDSubChunkRequest},
+	{"ItemRegistry", packet.IDItemRegistry},
+	{"BiomeDefinitionList", packet.IDBiomeDefinitionList},
+	{"AvailableActorIdentifiers", packet.IDAvailableActorIdentifiers},
+	{"CraftingData", packet.IDCraftingData},
+	{"CreativeContent", packet.IDCreativeContent},
+	{"InventoryContent", packet.IDInventoryContent},
+	{"InventorySlot", packet.IDInventorySlot},
+	{"MobEquipment", packet.IDMobEquipment},
+	{"AddActor", packet.IDAddActor},
+	{"SetActorData", packet.IDSetActorData},
+	{"UpdateBlock", packet.IDUpdateBlock},
+	{"ResourcePackStack", packet.IDResourcePackStack},
+	{"ResourcePackDataInfo", packet.IDResourcePackDataInfo},
+	{"ResourcePackChunkData", packet.IDResourcePackChunkData},
+	{"PlayerAuthInput", packet.IDPlayerAuthInput},
+}
+
+type packetCounter struct {
+	mu       sync.Mutex
+	counts   map[string]uint64
+	idToName map[uint32]string
+	total    uint64
+	unknown  uint64
+}
+
+func newPacketCounter() *packetCounter {
+	c := &packetCounter{counts: make(map[string]uint64), idToName: make(map[uint32]string)}
+	for _, tp := range trackedPackets {
+		c.counts[tp.name] = 0
+		c.idToName[tp.id] = tp.name
+	}
+	return c
+}
+
+func (c *packetCounter) add(id uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.total++
+	if name, ok := c.idToName[id]; ok {
+		c.counts[name]++
+	} else {
+		c.unknown++
+	}
+}
+
+func (c *packetCounter) snapshot() (map[string]uint64, uint64, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]uint64, len(c.counts))
+	for k, v := range c.counts {
+		out[k] = v
+	}
+	return out, c.total, c.unknown
+}
+
+// sameItemIDs compares the (name, runtimeID) pairs of two item registries.
+// Re-implemented locally from cmd/xvrelay/item_registry_test.go so selfcheck
+// stays an independent binary (no test-only package imports).
+func sameItemIDs(a, b []protocol.ItemEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ids := make(map[string]int16, len(b))
+	for _, e := range b {
+		ids[e.Name] = e.RuntimeID
+	}
+	for _, e := range a {
+		if id, ok := ids[e.Name]; !ok || id != e.RuntimeID {
+			return false
+		}
+	}
+	return true
+}
+
+func codecFor(id int32) (minecraft.Protocol, error) {
+	switch id {
+	case 1001:
+		return v1_26_30.New(), nil
+	case 2168:
+		return v1_26_44.New(), nil
+	case 2169:
+		return v1_26_45.New(), nil
+	case 2193:
+		return minecraft.DefaultProtocol, nil
+	default:
+		return nil, fmt.Errorf("invalid -proto %d (valid: 1001|2168|2169|2193)", id)
+	}
+}
+
+func isDeadline(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(strings.ToLower(err.Error()), "deadline exceeded")
+}
+
+// dialRelay bounds the dial both by ctx and by a hard wall-clock limit, so a
+// missing/unreachable relay always produces a clear error instead of a hang.
+func dialRelay(ctx context.Context, cfg config, codec minecraft.Protocol, name string) (*minecraft.Conn, error) {
+	d := minecraft.Dialer{
+		Protocol:                   codec,
+		ClientData:                 login.ClientData{GameVersion: codec.Ver()},
+		IdentityData:               login.IdentityData{DisplayName: name, Identity: uuid.New().String()},
+		DisconnectOnUnknownPackets: false,
+	}
+	type result struct {
+		conn *minecraft.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, err := d.DialContext(ctx, "raknet", cfg.addr)
+		ch <- result{conn: c, err: err}
+	}()
+	hard := cfg.spawnTimeout + 500*time.Millisecond
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-time.After(hard):
+		return nil, fmt.Errorf("hard dial timeout after %s: no listener at %s", hard, cfg.addr)
+	}
+}
+
+func runSession(cfg config, codec minecraft.Protocol, index int) session {
+	start := time.Now()
+	s := session{
+		Proto:            cfg.proto,
+		Addr:             cfg.addr,
+		Timestamp:        start.UTC().Format(time.RFC3339Nano),
+		Packets:          make(map[string]uint64),
+		Items:            make([]itemSample, 0),
+		CPU:              cpuNote,
+		DisconnectReason: "not connected",
+	}
+	for _, tp := range trackedPackets {
+		s.Packets[tp.name] = 0
+	}
+
+	names := []string{"connect", "spawn", "item_registry", "level_chunk", "packets_total"}
+	if cfg.soak > 0 {
+		names = append(names, "soak_no_early_disconnect")
+	}
+	checks := make(map[string]assertion, len(names))
+	for _, n := range names {
+		checks[n] = assertion{Name: n, OK: false, Detail: "not evaluated"}
+	}
+	setCheck := func(name string, ok bool, detail string) {
+		checks[name] = assertion{Name: name, OK: ok, Detail: detail}
+	}
+	finish := func() session {
+		for _, n := range names {
+			s.Assertions = append(s.Assertions, checks[n])
+		}
+		s.OK = s.Error == ""
+		for _, a := range s.Assertions {
+			if !a.OK {
+				s.OK = false
+			}
+		}
+		return s
+	}
+
+	name := fmt.Sprintf("SelfCheck%d", index+1)
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), cfg.spawnTimeout)
+	defer dialCancel()
+
+	vlog("session %d: dialing %s as protocol %d (%s)", index+1, cfg.addr, cfg.proto, codec.Ver())
+	conn, err := dialRelay(dialCtx, cfg, codec, name)
+	if err != nil {
+		s.Error = fmt.Sprintf("dial %s: %v", cfg.addr, err)
+		s.DisconnectReason = s.Error
+		setCheck("connect", false, s.Error)
+		reason := "skipped: connect failed"
+		for _, n := range names[1:] {
+			setCheck(n, false, reason)
+		}
+		vlog("session %d: %s", index+1, s.Error)
+		return finish()
+	}
+	defer conn.Close()
+	setCheck("connect", true, "RakNet dial succeeded")
+
+	// 1. DoSpawn within -spawn-timeout.
+	spawnCtx, spawnCancel := context.WithTimeout(context.Background(), cfg.spawnTimeout)
+	spawnStart := time.Now()
+	spawnErr := conn.DoSpawnContext(spawnCtx)
+	spawnCancel()
+	s.SpawnMS = time.Since(spawnStart).Milliseconds()
+	if spawnErr != nil {
+		s.Error = fmt.Sprintf("DoSpawn: %v", spawnErr)
+		s.DisconnectReason = s.Error
+		setCheck("spawn", false, s.Error)
+		reason := "skipped: DoSpawn failed"
+		for _, n := range names[2:] {
+			setCheck(n, false, reason)
+		}
+		vlog("session %d: %s", index+1, s.Error)
+		return finish()
+	}
+	setCheck("spawn", true, fmt.Sprintf("spawned in %d ms (limit %s)", s.SpawnMS, cfg.spawnTimeout))
+	vlog("session %d: spawned in %d ms", index+1, s.SpawnMS)
+
+	// GameData().Items: count plus the full name -> runtimeID list.
+	gd := conn.GameData()
+	s.GameDataItems = len(gd.Items)
+	s.Items = make([]itemSample, 0, len(gd.Items))
+	for _, e := range gd.Items {
+		s.Items = append(s.Items, itemSample{Name: e.Name, RuntimeID: e.RuntimeID})
+	}
+	want, wantErr := blocktranslate.Items(cfg.proto)
+	switch {
+	case wantErr != nil:
+		s.ItemRegistryMatch = false
+		setCheck("item_registry", false, fmt.Sprintf("blocktranslate.Items(%d): %v", cfg.proto, wantErr))
+	case len(gd.Items) == 0:
+		s.ItemRegistryMatch = false
+		setCheck("item_registry", false, "GameData().Items is empty")
+	default:
+		s.ItemRegistryMatch = sameItemIDs(gd.Items, want)
+		if s.ItemRegistryMatch {
+			setCheck("item_registry", true, fmt.Sprintf("%d entries match blocktranslate.Items(%d)", len(gd.Items), cfg.proto))
+		} else {
+			setCheck("item_registry", false, fmt.Sprintf("%d GameData entries differ from the %d pinned %d entries", len(gd.Items), len(want), cfg.proto))
+		}
+	}
+
+	// Read packets in a goroutine with short, refreshed deadlines until the
+	// session window ends. Sample heap/goroutines every second meanwhile.
+	window := cfg.soak
+	if window <= 0 {
+		window = defaultDrainWindow
+	}
+	stopAt := time.Now().Add(window)
+	vlog("session %d: reading packets for %s", index+1, window)
+
+	stopSamples := make(chan struct{})
+	sampleDone := make(chan struct{})
+	var sampleMu sync.Mutex
+	var samples []heapSample
+	takeSample := func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		sampleMu.Lock()
+		samples = append(samples, heapSample{
+			OffsetMS:       time.Since(start).Milliseconds(),
+			HeapAllocBytes: m.Alloc,
+			NumGoroutine:   runtime.NumGoroutine(),
+		})
+		sampleMu.Unlock()
+	}
+	takeSample()
+	go func() {
+		defer close(sampleDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				takeSample()
+			case <-stopSamples:
+				takeSample()
+				return
+			}
+		}
+	}()
+
+	counter := newPacketCounter()
+	readDone := make(chan error, 1)
+	go func() {
+		for {
+			remaining := time.Until(stopAt)
+			if remaining <= 0 {
+				readDone <- nil
+				return
+			}
+			dl := readDeadlineSlice
+			if remaining < dl {
+				dl = remaining
+			}
+			if dl < time.Millisecond {
+				dl = time.Millisecond
+			}
+			if err := conn.SetReadDeadline(time.Now().Add(dl)); err != nil {
+				readDone <- err
+				return
+			}
+			pk, err := conn.ReadPacket()
+			if err != nil {
+				if isDeadline(err) {
+					if time.Now().Before(stopAt) {
+						continue
+					}
+					readDone <- nil
+					return
+				}
+				readDone <- err
+				return
+			}
+			counter.add(pk.ID())
+		}
+	}()
+
+	readErr := <-readDone
+	close(stopSamples)
+	<-sampleDone
+
+	counts, total, unknown := counter.snapshot()
+	s.Packets = counts
+	s.PacketsTotal = total
+	s.Chunks = counts["LevelChunk"]
+	s.SubChunks = counts["SubChunk"]
+	s.LifetimeMS = time.Since(start).Milliseconds()
+
+	sampleMu.Lock()
+	if n := len(samples); n > 0 {
+		s.HeapSamples = samples
+		s.HeapAllocBytes = samples[n-1].HeapAllocBytes
+		s.NumGoroutine = samples[n-1].NumGoroutine
+	}
+	sampleMu.Unlock()
+
+	switch {
+	case readErr != nil:
+		s.DisconnectReason = readErr.Error()
+	case cfg.soak > 0:
+		s.DisconnectReason = "soak_complete"
+	default:
+		s.DisconnectReason = "drain_complete"
+	}
+
+	setCheck("level_chunk", s.Chunks > 0, fmt.Sprintf("LevelChunk=%d (must be > 0)", s.Chunks))
+	setCheck("packets_total", total > 0, fmt.Sprintf("packets_total=%d (must be > 0)", total))
+	if cfg.soak > 0 {
+		if readErr != nil {
+			setCheck("soak_no_early_disconnect", false,
+				fmt.Sprintf("disconnected after %d ms, before %s soak ended: %v", s.LifetimeMS, cfg.soak, readErr))
+		} else {
+			setCheck("soak_no_early_disconnect", true,
+				fmt.Sprintf("stayed connected for %d ms (soak %s)", s.LifetimeMS, cfg.soak))
+		}
+	}
+
+	if cfg.verbose {
+		for _, tp := range trackedPackets {
+			vlog("session %d: %-28s %d", index+1, tp.name, s.Packets[tp.name])
+		}
+		vlog("session %d: total=%d unknown=%d items=%d heap=%d goroutines=%d reason=%s",
+			index+1, total, unknown, s.GameDataItems, s.HeapAllocBytes, s.NumGoroutine, s.DisconnectReason)
+	}
+	return finish()
+}
+
+func printSummary(sessions []session, cfg config) {
+	fmt.Printf("selfcheck: %d session(s), addr=%s proto=%d spawn-timeout=%s soak=%s json=%q\n",
+		len(sessions), cfg.addr, cfg.proto, cfg.spawnTimeout, cfg.soak, cfg.jsonPath)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "#\tPROTO\tSPAWN_MS\tLIFETIME_MS\tPACKETS\tCHUNKS\tSUBCHUNKS\tITEMS\tREGISTRY\tDISCONNECT\tOK")
+	for i, s := range sessions {
+		fmt.Fprintf(w, "%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%t\t%s\t%t\n",
+			i+1, s.Proto, s.SpawnMS, s.LifetimeMS, s.PacketsTotal, s.Chunks, s.SubChunks,
+			s.GameDataItems, s.ItemRegistryMatch, s.DisconnectReason, s.OK)
+	}
+	_ = w.Flush()
+	fmt.Printf("note: %s (heap_alloc_bytes / num_goroutine are sampled every 1s)\n", cpuNote)
+}
+
+func run() int {
+	var (
+		addr         = flag.String("addr", "127.0.0.1:19164", "RakNet listener address of the relay")
+		proto        = flag.Int("proto", 2193, "client protocol (1001|2168|2169|2193)")
+		spawnTimeout = flag.Duration("spawn-timeout", 15*time.Second, "timeout for dial + DoSpawn")
+		soak         = flag.Duration("soak", 0, "keep the connection and read packets for this long (>0 enables the soak assertion)")
+		reconnect    = flag.Int("reconnect", 0, "number of additional reconnects after the initial session (total = 1 + N)")
+		jsonPath     = flag.String("json", "", "write the JSON session report to this path")
+		verboseFlag  = flag.Bool("v", false, "verbose logging to stderr")
+	)
+	flag.Parse()
+	verbose = *verboseFlag
+
+	cfg := config{
+		addr:         *addr,
+		proto:        int32(*proto),
+		spawnTimeout: *spawnTimeout,
+		soak:         *soak,
+		reconnect:    *reconnect,
+		jsonPath:     *jsonPath,
+		verbose:      *verboseFlag,
+	}
+	if cfg.spawnTimeout <= 0 || cfg.soak < 0 || cfg.reconnect < 0 {
+		fmt.Fprintln(os.Stderr, "selfcheck: -spawn-timeout must be > 0, -soak and -reconnect must be >= 0")
+		return 1
+	}
+	codec, err := codecFor(cfg.proto)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "selfcheck:", err)
+		return 1
+	}
+
+	attempts := 1 + cfg.reconnect
+	sessions := make([]session, 0, attempts)
+	for i := 0; i < attempts; i++ {
+		s := runSession(cfg, codec, i)
+		sessions = append(sessions, s)
+		for _, a := range s.Assertions {
+			if !a.OK {
+				fmt.Fprintf(os.Stderr, "FAIL assertion: %s: %s\n", a.Name, a.Detail)
+			}
+		}
+		if s.Error != "" {
+			fmt.Fprintf(os.Stderr, "selfcheck: session %d: %s\n", i+1, s.Error)
+		}
+	}
+
+	if cfg.jsonPath != "" {
+		data, err := json.MarshalIndent(sessions, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "selfcheck: marshal report: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(cfg.jsonPath, append(data, '\n'), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "selfcheck: write %s: %v\n", cfg.jsonPath, err)
+			return 1
+		}
+		fmt.Printf("selfcheck: report written to %s\n", cfg.jsonPath)
+	}
+
+	printSummary(sessions, cfg)
+	for _, s := range sessions {
+		if !s.OK {
+			return 1
+		}
+	}
+	return 0
+}
+
+func main() { os.Exit(run()) }

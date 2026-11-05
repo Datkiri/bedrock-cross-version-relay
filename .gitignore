@@ -12,6 +12,9 @@ wire-*.bin
 subchunk-*.bin
 startgame-*.bin
 
+# Local scratch: measurement files moved aside instead of hard-deleted (safe-delete guard)
+._trash/
+
 # Java build output
 *.class
 /java/out/
