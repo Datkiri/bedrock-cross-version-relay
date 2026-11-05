@@ -54,6 +54,7 @@ type config struct {
 	noSubchunk   bool
 	inputFlags   bool
 	noFail       bool
+	itemLog      int // max item log lines; 0 = none, <0 = unlimited
 }
 
 func codecFor(id int32) (minecraft.Protocol, error) {
@@ -122,6 +123,15 @@ type report struct {
 	AuthInput         uint64            `json:"auth_input"`
 	Commands          int               `json:"commands"`
 	CommandFailures   int               `json:"command_failures"`
+	ItemsDecoded      uint64            `json:"items_decoded"`
+	ItemsVisible      uint64            `json:"items_visible"`
+	ItemsLost         uint64            `json:"items_lost"`
+	ItemsUnknown      uint64            `json:"items_unknown"`
+	ItemsEmptySlots   uint64            `json:"items_empty_slots"`
+	ItemsTableSize    int               `json:"items_table_size"`
+	ItemsByPacket     map[string]uint64 `json:"items_by_packet,omitempty"`
+	ItemsSamples      []string          `json:"items_visible_samples,omitempty"`
+	ItemsLostFamilies []string          `json:"items_lost_families,omitempty"`
 	QuitReason        string            `json:"quit_reason"`
 	Assertions        []assertion       `json:"assertions"`
 	DisconnectReason  string            `json:"disconnect_reason"`
@@ -189,6 +199,25 @@ func buildReport(s *session, cmdCount, cmdFailures int, quitReason string) repor
 	}
 	s.mu.Unlock()
 
+	// Live wire item census: these are IDs a real headless client actually
+	// decoded, resolved against its own protocol table.
+	items := s.itemSummary()
+	r.ItemsDecoded, _ = items["items_decoded"].(uint64)
+	r.ItemsVisible, _ = items["items_visible"].(uint64)
+	r.ItemsLost, _ = items["items_lost"].(uint64)
+	r.ItemsUnknown, _ = items["items_unknown"].(uint64)
+	r.ItemsEmptySlots, _ = items["items_empty_slots"].(uint64)
+	r.ItemsTableSize, _ = items["items_table_size"].(int)
+	if v, ok := items["items_by_packet"].(map[string]uint64); ok {
+		r.ItemsByPacket = v
+	}
+	if v, ok := items["items_visible_samples"].([]string); ok {
+		r.ItemsSamples = v
+	}
+	if v, ok := items["items_lost_families"].([]string); ok {
+		r.ItemsLostFamilies = v
+	}
+
 	add := func(name string, ok bool, detail string) {
 		r.Assertions = append(r.Assertions, assertion{Name: name, OK: ok, Detail: detail})
 	}
@@ -236,6 +265,14 @@ func buildReport(s *session, cmdCount, cmdFailures int, quitReason string) repor
 			fmt.Sprintf("sent %d SubChunkRequest, received %d SubChunk", num("chunk_requests"), replies))
 	}
 	add("command_failures", cmdFailures == 0, fmt.Sprintf("%d of %d commands failed", cmdFailures, cmdCount))
+	add("items_decoded", r.ItemsDecoded > 0,
+		fmt.Sprintf("%d item stacks decoded from the live wire", r.ItemsDecoded))
+	add("items_visible", r.ItemsVisible > 0,
+		fmt.Sprintf("%d decoded stacks resolved to a named item in the %d-entry table", r.ItemsVisible, r.ItemsTableSize))
+	add("items_no_air_loss", r.ItemsLost == 0,
+		fmt.Sprintf("%d creative/recipe entries arrived as AIR", r.ItemsLost))
+	add("items_no_unknown_id", r.ItemsUnknown == 0,
+		fmt.Sprintf("%d stacks carried an ID absent from the client's item table", r.ItemsUnknown))
 
 	r.OK = r.Error == ""
 	for _, a := range r.Assertions {
@@ -253,6 +290,14 @@ func printReport(r report) {
 		r.PacketsTotal, r.Packets["LevelChunk"], r.Packets["SubChunk"], r.GameDataItems, r.ItemRegistryMatch)
 	fmt.Printf("  sent=%d (PlayerAuthInput=%d SubChunkRequest=%d) echo=%d forms=%d errors: send=%d decode=%d\n",
 		r.SentTotal, r.Sent["PlayerAuthInput"], r.Sent["SubChunkRequest"], r.LatencyEcho, r.Forms, r.SendErrors, r.DecodeErrors)
+	fmt.Printf("  items: decoded=%d visible=%d lost=%d unknown=%d empty_slots=%d table=%d by_packet=%v\n",
+		r.ItemsDecoded, r.ItemsVisible, r.ItemsLost, r.ItemsUnknown, r.ItemsEmptySlots, r.ItemsTableSize, r.ItemsByPacket)
+	if len(r.ItemsSamples) > 0 {
+		fmt.Printf("  items_visible_samples=%v\n", r.ItemsSamples)
+	}
+	if len(r.ItemsLostFamilies) > 0 {
+		fmt.Printf("  items_lost_families=%v\n", r.ItemsLostFamilies)
+	}
 	if r.BadPackets > 0 {
 		fmt.Printf("  DECODE: bad=%d last_id=%d payload_len=%d err=%q\n",
 			r.BadPackets, r.LastBadPacketID, r.LastBadLen, r.LastBadError)
@@ -283,6 +328,7 @@ func run() int {
 		noSubchunk   = flag.Bool("no-subchunk", false, "disable SubChunkRequest (bisect)")
 		inputFlags   = flag.Bool("input-flags", false, "set jump/sneak/sprint flags in PlayerAuthInput (bisect)")
 		noFail       = flag.Bool("nofail", false, "always exit 0 even when assertions fail (bisect)")
+		itemLog      = flag.Int("item-log", 24, "max ITEM_VISIBLE/ITEM_LOST/ITEM_UNKNOWN_ID log lines (0 = off, <0 = all)")
 	)
 	flag.Parse()
 
@@ -301,6 +347,7 @@ func run() int {
 		noSubchunk:   *noSubchunk,
 		inputFlags:   *inputFlags,
 		noFail:       *noFail,
+		itemLog:      *itemLog,
 	}
 	if cfg.spawnTimeout <= 0 || cfg.duration < 0 {
 		fmt.Fprintln(os.Stderr, "clientclone: -spawn-timeout must be > 0 and -duration >= 0")

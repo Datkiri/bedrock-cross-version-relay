@@ -1,8 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"bedrock-cross-version-relay/internal/blocktranslate"
+	"bytes"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -41,10 +41,12 @@ func (p host1001Protocol) ConvertFromLatest(pk packet.Packet, conn *minecraft.Co
 	return p.Protocol.ConvertFromLatest(pk, conn)
 }
 
-// host1001Protocol replaces only the lossy incoming CraftingData decoder.
-// The pinned adapter discards numeric ingredient IDs in items.go. By the time
-// ConvertToLatest runs they cannot be recovered. All other packets and outgoing
-// layouts still use that pinned adapter. Registry lookup is per connection.
+// host1001Protocol replaces the lossy incoming CraftingData decoder and maps
+// CreativeContent item IDs. The pinned adapter discards numeric ingredient IDs
+// in items.go (unrecoverable by ConvertToLatest), and its convertGameplayToLatest
+// has NO CreativeContent case: it forwards host-1001 runtime IDs unchanged.
+// All other packets and outgoing layouts still use the pinned adapter. Registry
+// lookup is per connection.
 type host1001Protocol struct{ minecraft.Protocol }
 
 func (p host1001Protocol) Packets(listener bool) packet.Pool {
@@ -77,7 +79,96 @@ func (p host1001Protocol) ConvertToLatest(pk packet.Packet, conn *minecraft.Conn
 			"shaped", len(decoded.ShapedRecipes), "shapeless", len(decoded.ShapelessRecipes))
 		return []packet.Packet{decoded}
 	}
-	return p.Protocol.ConvertToLatest(pk, conn)
+	// The pinned adapter's ConvertToLatest unwraps its internal translatedPacket
+	// BEFORE convertGameplayToLatest runs, so a *packet.CreativeContent assertion
+	// on the raw pk never matches. Inspect the CONVERTED output instead.
+	out := p.Protocol.ConvertToLatest(pk, conn)
+	if conn == nil {
+		return out // offline callers have no host registry to resolve names with
+	}
+	for i, q := range out {
+		creative, ok := q.(*packet.CreativeContent)
+		if !ok {
+			continue
+		}
+		mapped, st, err := mapHostCreative1001(creative, conn.GameData().Items)
+		if err != nil {
+			slog.Error("xvrelay: host1001 creative translation failed", "error", err)
+			_ = conn.Close()
+			panic(err)
+		}
+		slog.Info("xvrelay: host1001 creative items mapped to native IDs",
+			"items", len(mapped.Items), "mapped", st.mapped, "dropped", st.dropped, "unknown", st.unknown)
+		out[i] = mapped
+	}
+	return out
+}
+
+// creative1001Stats counts what happened to the host's creative entries.
+type creative1001Stats struct{ mapped, dropped, unknown int }
+
+// mapHostCreative1001 translates a 1001 host's CreativeContent item IDs into
+// native 2193 IDs. Without this, the pinned adapter's convertGameplayToLatest
+// (v1_26_30/gameplay_mapping.go, default branch) passes the packet through:
+// a 2193 client then decodes IDs absent from its own table (measured live:
+// 257 copper_spear, 427 black_dye, 716/717/719 pottery sherds), while
+// 1001/2168/2169 clients silently drop those entries in targetCreativeContent
+// because NativeToTarget fails on a non-native ID. Resolution is by NAME via
+// the host's ItemRegistry, exactly like decodeHostRecipes1001 does for recipes.
+func mapHostCreative1001(current *packet.CreativeContent, entries []protocol.ItemEntry) (*packet.CreativeContent, creative1001Stats, error) {
+	native, err := blocktranslate.Items(2193)
+	if err != nil {
+		return nil, creative1001Stats{}, err
+	}
+	hostByID := make(map[int32]string, len(entries))
+	nativeByName := make(map[string]int32, len(native))
+	for _, e := range entries {
+		hostByID[int32(e.RuntimeID)] = e.Name
+	}
+	for _, e := range native {
+		nativeByName[e.Name] = int32(e.RuntimeID)
+	}
+
+	cloned := *current
+	cloned.Groups = append([]protocol.CreativeGroup(nil), current.Groups...)
+	cloned.Items = make([]protocol.CreativeItem, 0, len(current.Items))
+	var st creative1001Stats
+	resolve := func(id int32) (int32, bool) {
+		if id == 0 {
+			return 0, true
+		}
+		name, ok := hostByID[id]
+		if !ok {
+			// ID absent from the host registry: never forward an unresolvable ID.
+			st.unknown++
+			return 0, false
+		}
+		nativeID, ok := nativeByName[name]
+		if !ok {
+			// Addon/resource-pack item the newer client does not have.
+			st.dropped++
+			return 0, false
+		}
+		st.mapped++
+		return nativeID, true
+	}
+	for _, item := range current.Items {
+		id, ok := resolve(item.Item.NetworkID)
+		if !ok {
+			continue
+		}
+		item.Item.NetworkID = id
+		cloned.Items = append(cloned.Items, item)
+	}
+	for i := range cloned.Groups {
+		id, ok := resolve(cloned.Groups[i].Icon.NetworkID)
+		if !ok {
+			cloned.Groups[i].Icon = protocol.ItemStack{}
+			continue
+		}
+		cloned.Groups[i].Icon.NetworkID = id
+	}
+	return &cloned, st, nil
 }
 
 // Only reading is implemented here. Base legacy IO retains its item/NBT and

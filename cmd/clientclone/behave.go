@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-gl/mathgl/mgl32"
@@ -154,6 +155,13 @@ type session struct {
 	direct           bool
 	disconnectReason string
 	errorText        string
+
+	// Live wire item census (#19). itemsReady is set before the read loop
+	// starts, so observeItems() can cheaply check it without taking s.mu.
+	items        itemStats
+	itemsIndex   itemIndex
+	itemsReady   atomic.Bool
+	itemLogCount int
 }
 
 func newSession(cfg config) *session {
@@ -168,6 +176,7 @@ func newSession(cfg config) *session {
 		packets:    make(map[string]uint64),
 		sent:       make(map[string]uint64),
 		chunkSeen:  make(map[chunkKey]bool),
+		items:      newItemStats(),
 		start:      time.Now(),
 		hotbarSlot: 0,
 	}
@@ -294,6 +303,19 @@ func (s *session) join(addr string, direct bool, protoOverride int32, nameOverri
 	}
 
 	s.gd = conn.GameData()
+
+	// Resolve live item IDs against the CLIENT's own protocol table: the relay
+	// encodes target-protocol IDs on the wire. Build the index before starting
+	// the read loop so observeItems() never sees a half-built map.
+	if idx, err := newItemIndex(protoID); err != nil {
+		slog.Warn("clientclone: item index unavailable", "proto", protoID, "error", err)
+	} else {
+		s.itemsIndex = idx
+		s.itemsReady.Store(true)
+		fmt.Fprintf(os.Stderr, "clientclone: item index ready proto=%d entries=%d (live wire IDs resolve against this table)\n",
+			protoID, idx.count)
+	}
+
 	s.mu.Lock()
 	s.pos = s.gd.PlayerPosition
 	s.pitch, s.yaw = s.gd.Pitch, s.gd.Yaw
@@ -362,6 +384,7 @@ func (s *session) readLoop() {
 			return
 		}
 		s.countPacket(pk)
+		s.observeItems(pk)
 		s.handle(pk)
 	}
 }
@@ -659,6 +682,8 @@ func (s *session) stop() {
 
 // snapshot returns the live metric view used by commands and the final report.
 func (s *session) snapshot() map[string]any {
+	// itemSummary takes s.mu itself, so collect it before locking here.
+	itemSnap := s.itemSummary()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	decodeErrors, lastDecodeErr := s.errCounter.snapshot()
@@ -700,6 +725,9 @@ func (s *session) snapshot() map[string]any {
 	}
 	for k, v := range s.sent {
 		m["sent_"+k] = v
+	}
+	for k, v := range itemSnap {
+		m[k] = v
 	}
 	if lastDecodeErr != "" {
 		m["last_decode_error"] = lastDecodeErr

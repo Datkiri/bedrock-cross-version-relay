@@ -226,6 +226,10 @@ Honest scope, because "it builds" and "it works" are different claims.
   not dropped, plain `New()` is a pass-through control, unknown IDs become AIR, and `resolveProto()`
   really returns a registry-aware adapter. Measured: 259 differing IDs / 1717 identical IDs among
   the 1976 shared names; 2076 native entries → 1976 emitted.
+- **Live wire item census:** `cmd/clientclone` decodes >5,000 item stacks per session from a live
+  BDS 1.26.33.1 and resolves every ID against the client's own table; all four protocols reported
+  `lost=0 unknown=0 ok=true` (see "Live item census" below). This is the measured replacement for
+  the vague "no real client has looked at the inventory" caveat — stacks are decoded, not rendered.
 - **Invisible-item audit (offline, wire-level):** `cmd/itemaudit` pushes every native `2193` item
   through the real client codec, encodes the packet with that protocol's writer, then decodes it
   with its own packet pool/reader — the same path `Conn.ReadPacket` uses. `NetworkID=0` after the
@@ -291,18 +295,17 @@ Honest scope, because "it builds" and "it works" are different claims.
   Recipes, biome schemas, entity metadata, block-entity NBT, particles and arbitrary add-on content
   are separate problems and are **not** solved here. The relay counts these packet families in the
   live self-check but does not re-map their payloads.
-- **The gameplay item fix is offline-verified, not client-verified.** `2168`/`2169` previously used
-  plain `v1_26_45.New()` codecs with no item mapper, so an `InventoryContent` packet kept the host's
-  IDs. They now default to `NewWithRegistries` fed the native `2193` table; a plain codec passes a
-  2076-entry `ItemRegistry` through unchanged while the registry-aware one emits 1976. The mapping
-  is asserted offline in `item_gameplay_test.go` (both directions, six packet families, no drops,
-  non-native input dropped). What has **not** been done is a real Bedrock client visually confirming
-  an inventory item; `-map-gameplay-items=false` exists to bisect that if it ever regresses. An
-  unknown runtime ID is replaced by AIR (`hideUnknown=true`) rather than dropped. Instead of leaving
-  that as a vague caveat, `cmd/itemaudit` now logs **by name** exactly which items become AIR for
-  each protocol (143 / 100 / 100 / 0) and cross-checks the list against the adapter's own mapper
-  fallbacks — see "What is actually verified". The honest boundary remains: no real client has
-  looked at the inventory.
+- **Gameplay item IDs are live-verified at the wire level, not visually.** `2168`/`2169` previously
+  used plain `v1_26_45.New()` codecs with no item mapper, so an `InventoryContent` packet kept the
+  host's IDs. They now default to `NewWithRegistries` fed the native `2193` table; a plain codec
+  passes a 2076-entry `ItemRegistry` through unchanged while the registry-aware one emits 1976. The
+  mapping is asserted offline in `item_gameplay_test.go` (both directions, six packet families, no
+  drops, non-native input dropped); `-map-gameplay-items=false` bisects it. `cmd/itemaudit` logs
+  **by name** exactly which items become AIR per protocol (143 / 100 / 100 / 0). `cmd/clientclone`
+  goes further: it decodes every item stack a real headless client receives and resolves each ID
+  against that client's own table — all four protocols decoded >5,000 named stacks from a live BDS
+  with `lost=0 unknown=0` (see "Live item census" below). The honest boundary remains: this is a
+  codec-level client that decodes stacks, not a game client rendering an inventory UI.
 - **Item runtime IDs are int16 on the wire.** `protocol.ItemInstance` writes `NetworkID` with
   `Int16`: an out-of-range probe `900001` decodes as `-17503` even through the identity `2193`
   codec, while in-range unknown IDs (`20000`) survive unchanged. Custom/add-on item IDs outside
@@ -343,9 +346,10 @@ Honest scope, because "it builds" and "it works" are different claims.
     multi-client, hours-long soak has **not** been run.
   - `CONN-005` — pack prefetch stays off; the self-check observed `ResourcePackStack/DataInfo/
     ChunkData = 0/0/0` on a pack-free BDS, so the pack edge cases are untested.
-  - `PROTO-005` — biome / actor-identifier / crafting / creative / inventory / block-entity packet
-    families are **counted** by the self-check (each `=1` in the live runs) but their payloads are
-    not semantically re-mapped.
+  - `PROTO-005` — **item runtime IDs** inside crafting / creative / inventory packets ARE mapped and
+    live-verified (see "Live item census"), but biome schemas, entity metadata, block-entity NBT,
+    particles and arbitrary add-on payload semantics are not re-mapped; those families are only
+    counted by the self-check.
   - `RELAY-001` — heap/goroutine samples exist; process-level CPU and latency percentiles are
     explicitly **not measured** ("process-level CPU is not portable across platforms").
   - `CONN-003` — the `ServerData` v5/v6/v7 parser is tested against malformed, truncated and
@@ -358,11 +362,13 @@ Honest scope, because "it builds" and "it works" are different claims.
 ```
 cmd/xvrelay/                 the relay: listener, dialer, spawn gate, translation wiring, bisect flags
 cmd/xvrelay/audit.go         re-parse client-bound chunks, check state IDs against the target registry
-cmd/xvrelay/host_recipes1001.go  recipe / movement-bitset handling for 1001 hosts
+cmd/xvrelay/host_recipes1001.go  recipe / creative-item / movement-bitset handling for 1001 hosts
+cmd/xvrelay/host_creative1001_test.go  pins host-1001 creative IDs -> native 2193 IDs
 cmd/xvrelay/item_gameplay_test.go  offline assertions for gameplay item-ID translation
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
+cmd/clientclone/items.go    live wire item census: decode stacks, resolve IDs, ITEM_VISIBLE / ITEM_LOST / ITEM_UNKNOWN_ID
 internal/blocktranslate/  block + item palette translation, pinned data, hash lookup
 internal/lansignal/       NetherNet LAN discovery on UDP 7551 (world list, signalling address)
 internal/mcport/          Minecraft port detection helpers
@@ -444,7 +450,8 @@ make clientclone
 Commands: `join`, `wait`, `move`, `look`, `jump`, `sneak`, `sprint`, `chat`, `hotbar`, `form`,
 `assert`, `dump`, `quit`. `assert` supports `>`, `>=`, `<`, `<=`, `==`, `!=` and `contains`
 against any metric listed by `dump`. `-auto` joins at startup from `-addr` / `-direct` / `-proto`.
-Bisect flags: `-no-input`, `-no-subchunk`, `-input-flags`, `-nofail`, `-v`.
+Bisect flags: `-no-input`, `-no-subchunk`, `-input-flags`, `-nofail`, `-v`. `-item-log N` caps the
+`ITEM_*` stderr lines (default 24, `0` = off, `<0` = all).
 
 **Bug this client found and verified (2026-11-05).** On a real BDS 1.26.33.1
 (`transport=raknet`) with a `1001` client, the first live run reported `decode_errors=2`,
@@ -488,6 +495,51 @@ match the measured AIR set exactly (`cross_check="OK: 143 ..."` / `"OK: 100 ..."
 runs this as a normal `go test ./...` regression, including the protocol-1001 `translatedPacket`
 trap: decoding its `InventoryContent` into a plain latest packet leaves 30219 unread bytes, while
 decoding through `codec.Packets(false)` leaves 0.
+
+### Live item census (headless client)
+
+`cmd/clientclone/items.go` answers the question the offline audit cannot: which item stacks did a
+real client **actually decode from the live wire**. Every post-spawn `InventoryContent`,
+`InventorySlot`, `MobEquipment`, `AddItemActor`, `CreativeContent` and `CraftingData` stack has its
+`NetworkID` resolved against `blocktranslate.Items(clientProto)` — the client's own table, not the
+native 2193 one. Each stack is logged as `ITEM_VISIBLE` (named item), `ITEM_LOST` (a
+creative/recipe entry that arrived as AIR, id 0) or `ITEM_UNKNOWN_ID` (non-zero ID absent from the
+table); `items_decoded/visible/lost/unknown/empty_slots`, `items_by_packet` and visible-name samples
+go into the JSON report and four new assertions.
+
+```bash
+./dist/clientclone -auto -addr 127.0.0.1:19164 -proto 2193 \
+  -script cmd/clientclone/scripts/bds-items.jsonl -duration 25s \
+  -item-log 8 -json dist/cc-items-2193.json
+```
+
+Measured against BDS 1.26.33.1 (`transport=raknet`, relay `-host-raknet 127.0.0.1:19132
+-host-proto 1001 -client-proto auto`), one session per protocol (2026-11-05):
+
+| Client proto | stacks decoded | visible | lost | unknown | `ok` |
+| --- | --- | --- | --- | --- | --- |
+| `1001` | 5122 | 5021 | 0 | 0 | true |
+| `2168` | 5123 | 5022 | 0 | 0 | true |
+| `2169` | 5123 | 5022 | 0 | 0 | true |
+| `2193` | 5621 | 5520 | 0 | 0 | true |
+
+**Bug this census found and fixed.** The first `2193` run exposed 5 `CreativeContent` stacks with
+IDs `257 / 427 / 716 / 717 / 719` — `copper_spear`, `black_dye` and three pottery sherds. Those
+names exist in the native 2193 table with different IDs (`854 / 398 / 689 / 690 / 692`), so the
+relay was forwarding **host 1001 IDs unchanged**: the pinned adapter's `convertGameplayToLatest`
+has no `CreativeContent` case (its `default` returns the packet untouched), while `CraftingData`
+was already handled by `host1001Protocol`. `host1001Protocol.ConvertToLatest` now maps the
+converted `CreativeContent` by name through the host `ItemRegistry` into native 2193 IDs. The
+mapping must run **after** delegating to the pinned adapter: the incoming packet is an unexported
+`translatedPacket` wrapper, and only the converted output is a plain `*packet.CreativeContent`.
+Before the fix, `1001`/`2168`/`2169` clients silently dropped those entries in
+`targetCreativeContent` (`NativeToTarget` fails on a non-native ID): live `CreativeContent` counts
+went `1349 → 1376`, `1369 → 1376`, `1369 → 1376`; the 2193 client went from 5 unknown IDs to 0.
+Relay log: `host1001 creative items mapped to native IDs items=1875 mapped=1962 dropped=0
+unknown=0`. `host_creative1001_test.go` pins the five IDs and the addon-drop case.
+
+Boundary: this is a headless codec-level client decoding item **stacks**; it still does not render
+an inventory UI.
 
 Measured baseline (2026-11-05, CGO disabled): `go build -buildvcs=false ./...`,
 `go vet ./...`, `go test -buildvcs=false ./...` all pass, including `cmd/selfcheck`,
