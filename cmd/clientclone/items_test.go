@@ -43,7 +43,16 @@ func TestItemIndexUsesClientProtocolTable(t *testing.T) {
 	}
 }
 
-func TestStacksFromCoversEveryItemFamily(t *testing.T) {
+// TestStacksFromCoversObservedItemFamilies pins the SIX families the live
+// census actually observes. It deliberately does NOT mean "every item packet":
+// AddPlayer.HeldItem, MobArmourEquipment (5 slots), InventoryTransaction
+// (actions + held item) and PlayerAuthInput.ItemInteractionData also carry
+// item runtime IDs and are remapped by the relay codec, but this headless
+// census does not observe them (PlayerAuthInput/InventoryTransaction are
+// mostly serverbound; the other two arrive with the spawn burst, before the
+// item index is ready). See cmd/xvrelay/semantic_coverage_test.go for the
+// measured ten-family codec coverage and README "Semantic packet coverage".
+func TestStacksFromCoversObservedItemFamilies(t *testing.T) {
 	cases := []struct {
 		name     string
 		pk       packet.Packet

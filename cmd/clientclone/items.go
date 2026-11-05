@@ -6,6 +6,13 @@ package main
 // handlers is looked up in the client's own protocol item table, so an unknown
 // or zeroed runtime ID is visible as a named log line instead of a vague
 // caveat. It is still a codec-level client: it does not render an inventory.
+//
+// SCOPE (PROTO-005): stacksFrom() observes SIX packet families, not every
+// item-carrying packet. The relay codec remaps TEN stack-carrying families
+// (see cmd/xvrelay/semantic_coverage_test.go); this census omits
+// AddPlayer.HeldItem, MobArmourEquipment, InventoryTransaction and
+// PlayerAuthInput.ItemInteractionData. The live census numbers are therefore
+// a lower bound on decoded stacks, not a complete item inventory of the wire.
 
 import (
 	"fmt"

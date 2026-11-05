@@ -166,10 +166,14 @@ the spawn-prefix gate are per-session, keyed by connection.
   and `item_gameplay_test.go`.
 - The registry-aware codecs also translate item runtime IDs **inside gameplay packets**, in both
   directions, not just the advertised registry. Measured offline: 259 item names carry different
-  `2193`/`2169` IDs (1717 are identical), `minecraft:apple` maps `882 → 878` and back `878 → 882`,
-  `plain New()` leaves `882` untouched, and all six item-carrying packet families survive
-  `ConvertFromLatest` (`out=1`). An unknown runtime ID is not dropped but replaced by AIR
-  (`hideUnknown=true`). Disable with `-map-gameplay-items=false` to reproduce the old behaviour.
+  `2193`/`2169` IDs (1717 are identical), `minecraft:apple` maps `882 → 878` and back `878 → 882`
+  (`1001` uses `285`), and `plain New()` leaves `882` untouched. `item_gameplay_test.go` pins a
+  **six-packet smoke subset** (including `ItemRegistry`); `semantic_coverage_test.go` measures the
+  real coverage: **10 stack-carrying packet families + the `ItemRegistry` table** are remapped by
+  `1001`/`2168`/`2169`, with `plain New()` and the native `2193` identity codec as pass-through
+  controls. An unknown runtime ID is not dropped but replaced by AIR (`hideUnknown=true`).
+  Disable with `-map-gameplay-items=false` to reproduce the old behaviour. See
+  [Semantic packet coverage](#semantic-packet-coverage-proto-005).
 - `SubChunk` v8 → v9 is upgraded when the target is `2193` (the Y byte after the storage count is new
   in v9); downgrades keep the remaining LevelChunk tail bytes intact.
 
@@ -227,14 +231,20 @@ Honest scope, because "it builds" and "it works" are different claims.
   pass-through codec case and the non-native-input drop are both asserted in
   `cmd/xvrelay/item_registry_test.go`.
 - **Gameplay item level (offline):** `cmd/xvrelay/item_gameplay_test.go` asserts bidirectional
-  runtime-ID translation for `1001`/`2168`/`2169`, six canonical item-carrying packet families are
-  not dropped, plain `New()` is a pass-through control, unknown IDs become AIR, and `resolveProto()`
-  really returns a registry-aware adapter. Measured: 259 differing IDs / 1717 identical IDs among
-  the 1976 shared names; 2076 native entries → 1976 emitted.
+  runtime-ID translation for `1001`/`2168`/`2169`, a six-packet smoke subset is not dropped, plain
+  `New()` is a pass-through control, unknown IDs become AIR, and `resolveProto()` really returns a
+  registry-aware adapter. Measured: 259 differing IDs / 1717 identical IDs among the 1976 shared
+  names; 2076 native entries → 1976 emitted. `cmd/xvrelay/semantic_coverage_test.go` then measures
+  the **full** item-family coverage: 10 stack-carrying families mapped on all three registry-aware
+  codecs, the `ItemRegistry` table emitting `1933`/`1976`/`1976` entries, plus controls.
 - **Live wire item census:** `cmd/clientclone` decodes >5,000 item stacks per session from a live
   BDS 1.26.33.1 and resolves every ID against the client's own table; all four protocols reported
   `lost=0 unknown=0 ok=true` (see "Live item census" below). This is the measured replacement for
   the vague "no real client has looked at the inventory" caveat — stacks are decoded, not rendered.
+  **Scope measured by `PROTO-005`:** the census observes **6 packet families**; the relay codec
+  maps **10** stack-carrying families. `AddPlayer.HeldItem`, `MobArmourEquipment`,
+  `InventoryTransaction` and `PlayerAuthInput.ItemInteractionData` are not counted, so those
+  >5,000 stacks are a lower bound, not a complete inventory of the wire.
 - **Invisible-item audit (offline, wire-level):** `cmd/itemaudit` pushes every native `2193` item
   through the real client codec, encodes the packet with that protocol's writer, then decodes it
   with its own packet pool/reader — the same path `Conn.ReadPacket` uses. `NetworkID=0` after the
@@ -306,11 +316,24 @@ Honest scope, because "it builds" and "it works" are different claims.
   declared and real sizes), `-pack-overrun abort` cancelled the dial in **35 ms** with exit 1, while
   `-pack-overrun report` let the same dial succeed (`overruns=1`). Default `-pack-mode skip`
   downloaded **0** packs. See "Resource-pack prefetch".
+- **Semantic packet coverage (`PROTO-005`, measured 2026-11-05):** `cmd/xvrelay/semantic_coverage_test.go`
+  drives the real `resolveProto()` codecs offline with packets built from real registry IDs. Result:
+  **10 stack-carrying families** are remapped by `1001`/`2168`/`2169` in both directions, the
+  **`ItemRegistry`** table emits `1933`/`1976`/`1976` entries, `plain New()` leaves all 10
+  untouched, and the `2193` identity codec keeps the native `882` apple ID. `CraftingData` keeps
+  **8 of 11** recipe slices (the two chemistry slices and `MaterialReducers` are dropped);
+  `ItemStackRequest`/`ItemStackResponse` carry **0** item runtime IDs. Narrow packed-ID cases
+  (`LevelEvent` legacy item particle, `ActorEvent` feed) are mapped `882 → 878`. Biome schemas,
+  generic entity metadata, spawn-particle payloads, block-entity NBT and actor identifiers are
+  forwarded unchanged with **0** item IDs. See "Semantic packet coverage".
 - **Live:** a real 1.26.51 client spawned and rendered terrain (grass, TNT, chest, player model)
   through a 1.26.33 host. That is one path, not all 16.
 - **Not verified:** real Minecraft sessions for every pair, add-ons, required/encrypted resource
-  packs, biomes, entity metadata, particles, long play sessions, and anything the matrix does not
-  name. The tests prove the invariants they check; they do not promise full gameplay compatibility.
+  packs, long play sessions, and anything the matrix does not name. Semantic payloads are now
+  **measured** rather than lumped together: biome schemas, generic entity metadata,
+  `SpawnParticleEffect` payloads, block-entity NBT and actor identifiers are forwarded unchanged;
+  only the narrow packed-ID cases named in "Semantic packet coverage" are rewritten. The tests
+  prove the invariants they check; they do not promise full gameplay compatibility.
 
 ## Limitations
 
@@ -332,20 +355,31 @@ Honest scope, because "it builds" and "it works" are different claims.
   921 LevelChunks, `registry=true`, exit 0.
 - **Terrain, block updates, clicked-block IDs, the advertised item registry and item IDs inside
   gameplay packets** are translated for all four client protocols (`1001`/`2168`/`2169`/`2193`).
-  Recipes, biome schemas, entity metadata, block-entity NBT, particles and arbitrary add-on content
-  are separate problems and are **not** solved here. The relay counts these packet families in the
-  live self-check but does not re-map their payloads.
+  Measured by `semantic_coverage_test.go`: item IDs are remapped in **10 stack-carrying packet
+  families** plus the `ItemRegistry` table; recipes are **partially** remapped — `CraftingData`
+  keeps 8 of 11 slices, dropping the two Education-Edition chemistry slices and `MaterialReducers`
+  (the `2193` identity path keeps all 11). Biome definitions, generic entity metadata,
+  `SpawnParticleEffect`, block-entity NBT, `AvailableActorIdentifiers` and arbitrary add-on
+  payload semantics are **not** re-mapped: the self-check counts those families but does not
+  translate their contents. Exceptions are narrow and measured: a packed item ID in `LevelEvent`'s
+  legacy particle event and `ActorEvent`'s feed event, plus block runtime IDs in `LevelEvent`
+  destroy/crack particles, `LevelSoundEvent`, `AddActor` falling-block metadata and the
+  `UpdateBlock*` family. See "Semantic packet coverage".
 - **Gameplay item IDs are live-verified at the wire level, not visually.** `2168`/`2169` previously
   used plain `v1_26_45.New()` codecs with no item mapper, so an `InventoryContent` packet kept the
   host's IDs. They now default to `NewWithRegistries` fed the native `2193` table; a plain codec
   passes a 2076-entry `ItemRegistry` through unchanged while the registry-aware one emits 1976. The
-  mapping is asserted offline in `item_gameplay_test.go` (both directions, six packet families, no
-  drops, non-native input dropped); `-map-gameplay-items=false` bisects it. `cmd/itemaudit` logs
-  **by name** exactly which items become AIR per protocol (143 / 100 / 100 / 0). `cmd/clientclone`
-  goes further: it decodes every item stack a real headless client receives and resolves each ID
-  against that client's own table — all four protocols decoded >5,000 named stacks from a live BDS
-  with `lost=0 unknown=0` (see "Live item census" below). The honest boundary remains: this is a
-  codec-level client that decodes stacks, not a game client rendering an inventory UI.
+  mapping is asserted offline in `item_gameplay_test.go` (both directions, a six-packet smoke
+  subset, no drops, non-native input dropped); `-map-gameplay-items=false` bisects it.
+  `cmd/itemaudit` logs **by name** exactly which items become AIR per protocol
+  (143 / 100 / 100 / 0). `cmd/clientclone`
+  goes further: it decodes every item stack in its **six observed packet families** and resolves
+  each ID against that client's own table — all four protocols decoded >5,000 named stacks from a
+  live BDS with `lost=0 unknown=0` (see "Live item census" below). Four more item-stack families
+  (`AddPlayer`, `MobArmourEquipment`, `InventoryTransaction`, `PlayerAuthInput`) are remapped by
+  the codec but **not** observed by this census, so the count is a lower bound. The honest
+  boundary remains: this is a codec-level client that decodes stacks, not a game client rendering
+  an inventory UI.
 - **Item runtime IDs are int16 on the wire.** `protocol.ItemInstance` writes `NetworkID` with
   `Int16`: an out-of-range probe `900001` decodes as `-17503` even through the identity `2193`
   codec, while in-range unknown IDs (`20000`) survive unchanged. Custom/add-on item IDs outside
@@ -399,10 +433,14 @@ Honest scope, because "it builds" and "it works" are different claims.
     login-phase pack packets are consumed internally by gophertunnel (`conn.spawn`), so those
     counters cannot observe the client-side pack download at all. That 0/0/0 is a measurement
     blind spot, not evidence that no pack was served.
-  - `PROTO-005` — **item runtime IDs** inside crafting / creative / inventory packets ARE mapped and
-    live-verified (see "Live item census"), but biome schemas, entity metadata, block-entity NBT,
-    particles and arbitrary add-on payload semantics are not re-mapped; those families are only
-    counted by the self-check.
+  - `PROTO-005` — **measured, not open on coverage**: `semantic_coverage_test.go` pins that 10
+    stack-carrying families + `ItemRegistry` are remapped, 8/11 `CraftingData` slices survive,
+    two packed-ID particle/feed cases are mapped, and five semantic payload families are forwarded
+    untouched (see "Semantic packet coverage"). Still **not** solved: biome schema *semantics*,
+    general entity metadata / block-entity NBT translation, full particle payload semantics,
+    add-on-defined items/behaviours, and a live census that observes all 10 families. The old
+    "recipes / biomes / particles are not solved here" claim was too broad; the recipe loss is now
+    measured precisely.
   - `RELAY-001` — per-operation `ns/op` / `B/op` / `allocs/op` are now **measured** for the codec,
     item-mapping and chunk-translation hot paths (see "Hot-path benchmarks"). Process-level CPU
     and end-to-end latency percentiles are still **not measured**: that metric is not portable
@@ -424,6 +462,7 @@ cmd/xvrelay/bench_test.go        hot-path benchmarks (codec / item / chunk) + fi
 cmd/xvrelay/concurrency_test.go  8-session loopback concurrency / isolation / leak / race harness
 cmd/xvrelay/packs.go        CONN-005 pack policy + per-dial guard + host-Protocol sniff wrapper
 cmd/xvrelay/packs_test.go   policy / budget / real-size lie / overrun abort / skipped-pack tests
+cmd/xvrelay/semantic_coverage_test.go  PROTO-005 measured item/particle/NBT family coverage (offline)
 cmd/itemaudit/              offline wire-level audit: logs exactly which items become AIR per protocol + JSON report
 cmd/selfcheck/              independent headless Bedrock client: spawn, packet counters, assertions, JSON report
 cmd/clientclone/            terminal, command-driven Bedrock client (JSON-lines commands, live BDS/relay tests)
@@ -608,6 +647,61 @@ pack was tested; required/encrypted/addon packs, multi-pack stacks and cache-onl
 the underlying connection on that path, so a host-side goroutine may linger until the transport
 disconnects — the same behaviour as the pre-existing `-dial-timeout` path.
 
+### Semantic packet coverage (`PROTO-005`)
+
+The old limitation text lumped recipes, biomes, entity metadata, particles and block-entity NBT
+together as "separate problems and not solved here". That was too broad.
+`cmd/xvrelay/semantic_coverage_test.go` builds packets with **real registry IDs** (looked up by
+name, never hard-coded), drives them through the same `resolveProto()` codecs the relay installs,
+and reads the resulting `NetworkID` fields back through reflection — necessary because
+`go-multiversion` returns packets inside an unexported `translatedPacket` wrapper that cannot be
+type-asserted from this package. Entirely offline: no BDS, no listener, no network.
+
+```bash
+CGO_ENABLED=0 go test -buildvcs=false ./cmd/xvrelay -run TestSemantic -count=1 -v
+```
+
+Measured 2026-11-05. Divergent fixture `minecraft:apple`: native `2193` = **882**, `1001` =
+**285**, `2168`/`2169` = **878**. H→C = host→client (`ConvertFromLatest`), C→H = client→host
+(`ConvertToLatest`).
+
+| Packet family | Direction | Registry-aware `1001`/`2168`/`2169` | `plain New()` | `2193` identity |
+| --- | --- | --- | --- | --- |
+| `CreativeContent` | H→C | `882 → 285 / 878` | `882` | `882` |
+| `CraftingData` (recipe outputs) | H→C | `882 → 285 / 878` | `882` | `882` |
+| `AddPlayer` (`HeldItem`) | H→C | `882 → 285 / 878` | `882` | `882` |
+| `AddItemActor` | H→C | `882 → 285 / 878` | `882` | `882` |
+| `InventoryContent` | H→C | `882 → 285 / 878` | `882` | `882` |
+| `InventorySlot` | H→C | `882 → 285 / 878` | `882` | `882` |
+| `MobEquipment` | H→C | `882 → 285 / 878` | `882` | `882` |
+| `MobArmourEquipment` (5 slots) | H→C | `882 → 285 / 878` (×5) | `882` | `882` |
+| `InventoryTransaction` (actions) | C→H | `285 / 878 → 882` | `285 / 878` | `882` |
+| `PlayerAuthInput` (`ItemInteractionData`) | C→H | `285 / 878 → 882` | `285 / 878` | `882` |
+| `ItemRegistry` (special case before the switch) | H→C | `2076 → 1933 / 1976 / 1976` entries; non-native input dropped | passthrough | `2076` |
+
+So the codec maps **10 stack-carrying families + the registry table**, not the "six" the older
+smoke test covered. `plain New()` (the `-map-gameplay-items=false` path) and the native `2193`
+identity codec are pinned as pass-through controls, so the mapping is attributable to
+`NewWithRegistries`.
+
+Other measured boundaries:
+
+| Case | Measured result |
+| --- | --- |
+| `CraftingData` recipe slices | **8 of 11** kept on `1001`/`2168`/`2169`; `ShapelessChemistryRecipes`, `ShapedChemistryRecipes` and `MaterialReducers` are set to `nil` by `mapCraftingData`. The `2193` identity path keeps all 11. `host1001Protocol` decodes those slices from the 1001 wire, but the client codec discards them again. |
+| `ItemStackRequest` / `ItemStackResponse` | **0** `NetworkID` fields. They use name-based identifiers and dynamic `StackNetworkID`, so there is no item runtime ID to remap; both pass through unchanged. |
+| `LevelEvent` legacy item particle (`0x4000\|14`), `ActorEvent` feed | packed item ID in `EventData` mapped `882 → 878`; `plain New()` keeps `882`. |
+| `LevelEvent` destroy/crack block, `LevelSoundEvent`, `AddActor` falling-block variant, `UpdateBlock*` | **block** runtime IDs are mapped (source-verified in `gameplay_transactions.go` / `gameplay_mapping.go`); these belong to the block translation path, not the item census. |
+| `BiomeDefinitionList`, `SetActorData`, `SpawnParticleEffect`, `BlockActorData` (NBT), `AvailableActorIdentifiers` | forwarded as **1 packet unchanged**, **0** item runtime IDs. `MapBiomeRuntimeID` is defined on every adapter but is **not part of** the vendored `minecraft.Protocol` interface and has **no call site** in this repo or the pinned `go-multiversion` module — it is a Dragonfly chunk-cache hook, not a relay path. |
+
+Honest boundaries: (1) `cmd/clientclone`'s live wire census observes only **6** of those 10
+families — `AddPlayer.HeldItem`, `MobArmourEquipment`, `InventoryTransaction` and
+`PlayerAuthInput.ItemInteractionData` are not counted, so its >5,000 stacks are a lower bound.
+(2) A "forwarded unchanged" packet is not a claim that its *semantics* are version-compatible:
+biome definitions, entity metadata, NBT and particle expressions may still mean different things
+across versions, and add-on-defined content is out of scope. (3) These are offline codec
+measurements; they do not replace a live cross-version play session.
+
 ### Terminal client clone (headless, command-driven)
 
 `cmd/clientclone` is the custom terminal Bedrock client for testing a relay (or a BDS directly)
@@ -725,7 +819,9 @@ Relay log: `host1001 creative items mapped to native IDs items=1875 mapped=1962 
 unknown=0`. `host_creative1001_test.go` pins the five IDs and the addon-drop case.
 
 Boundary: this is a headless codec-level client decoding item **stacks**; it still does not render
-an inventory UI.
+an inventory UI. It observes **6 of the 10** stack-carrying families the codec remaps — see
+[Semantic packet coverage](#semantic-packet-coverage-proto-005) — so `items_decoded` is a lower
+bound, not a complete census of item IDs on the wire.
 
 Measured baseline (2026-11-05, CGO disabled): `go build -buildvcs=false ./...`,
 `go vet ./...`, `go test -buildvcs=false ./...` all pass, including `cmd/selfcheck`,
